@@ -9,6 +9,7 @@ const FRAME_SWEEP_DELAYS_MS = [1200, 3500, 8000];
 const appState = {
   mode: MODE_IDLE,
   activeTabId: null,
+  workPreferredFrameId: null,
   sessionMemory: [],
   pendingBatch: [],
   demoStartedAt: 0,
@@ -70,6 +71,123 @@ function previewMultiline(text, maxLines = 14, maxChars = 1800) {
     preview += '\n…';
   }
   return preview;
+}
+
+function normalizeUrl(value) {
+  try {
+    return new URL(String(value || '')).toString();
+  } catch (_err) {
+    return String(value || '');
+  }
+}
+
+function scoreFrameCandidate(candidate, transcript) {
+  const href = String(candidate?.url || '').toLowerCase();
+  const title = String(candidate?.title || '').toLowerCase();
+  const transcriptText = String(transcript || '').toLowerCase();
+  let score = 0;
+
+  if (candidate?.frameId === 0) {
+    score += 2;
+  }
+  if (href.startsWith('https://')) {
+    score += 1;
+  }
+  if (title) {
+    score += 1;
+  }
+
+  // Strong negatives for non-target identity providers seen in failing traces.
+  if (href.includes('accounts.google.com/rotatecookiespage')) {
+    score -= 15;
+  }
+  if (href.includes('accounts.google.com')) {
+    score -= 10;
+  }
+
+  if (href.includes('docs.google.com/spreadsheets/')) {
+    score += 14;
+  } else if (href.includes('docs.google.com')) {
+    score += 6;
+  }
+  if (title.includes('google sheets')) {
+    score += 6;
+  }
+  if (transcriptText.includes('google sheets') && href.includes('docs.google.com')) {
+    score += 3;
+  }
+
+  return score;
+}
+
+async function discoverFrameCandidates(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: () => {
+        return {
+          url: window.location.href || '',
+          title: document.title || ''
+        };
+      }
+    });
+
+    return (Array.isArray(results) ? results : [])
+      .filter((entry) => typeof entry?.frameId === 'number')
+      .map((entry) => ({
+        frameId: entry.frameId,
+        url: normalizeUrl(entry?.result?.url || ''),
+        title: String(entry?.result?.title || '')
+      }));
+  } catch (err) {
+    console.error('[sw] discoverFrameCandidates failed', { tabId, err });
+    return [];
+  }
+}
+
+async function resolvePreferredWorkFrame(tabId, transcript, forceRefresh = false) {
+  if (!forceRefresh && typeof appState.workPreferredFrameId === 'number') {
+    return appState.workPreferredFrameId;
+  }
+
+  const candidates = await discoverFrameCandidates(tabId);
+  if (!candidates.length) {
+    appState.workPreferredFrameId = 0;
+    return 0;
+  }
+
+  const scored = candidates
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreFrameCandidate(candidate, transcript)
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const chosen = scored[0];
+  appState.workPreferredFrameId = typeof chosen?.frameId === 'number' ? chosen.frameId : 0;
+
+  await safeSendRuntimeMessage({
+    type: 'STATUS_UPDATE',
+    level: 'info',
+    message:
+      `[work-frame] selected frameId=${appState.workPreferredFrameId} score=${chosen?.score ?? 'n/a'} ` +
+      `url=${truncateForLog(chosen?.url || '', 200)}`
+  });
+
+  const alternatives = scored
+    .slice(0, 3)
+    .map((item) => `#${item.frameId}:${item.score}:${truncateForLog(item.url || '', 120)}`)
+    .join(' | ');
+  if (alternatives) {
+    await safeSendRuntimeMessage({
+      type: 'STATUS_UPDATE',
+      level: 'info',
+      message: `[work-frame] candidates ${alternatives}`
+    });
+  }
+
+  return appState.workPreferredFrameId;
 }
 
 async function captureDemoPageContext(tabId) {
@@ -558,14 +676,17 @@ async function startWorkMode(tabId) {
   try {
     appState.mode = MODE_WORK;
     appState.activeTabId = tabId;
+    appState.workPreferredFrameId = null;
     appState.sessionMemory = [];
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Work injection');
     scheduleFrameCoverageSweeps(tabId, MODE_WORK);
+    await resolvePreferredWorkFrame(tabId, '', true);
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Work mode started.' });
   } catch (err) {
     console.error('[sw] startWorkMode failed', err);
     appState.mode = MODE_IDLE;
     appState.activeTabId = null;
+    appState.workPreferredFrameId = null;
     throw err;
   }
 }
@@ -575,6 +696,7 @@ async function stopWorkMode() {
     appState.mode = MODE_IDLE;
     appState.sessionMemory = [];
     appState.activeTabId = null;
+    appState.workPreferredFrameId = null;
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Work mode stopped.' });
   } catch (err) {
     console.error('[sw] stopWorkMode failed', err);
@@ -655,6 +777,7 @@ async function handleWorkInstruction(transcript, tabId) {
     if (typeof targetTabId !== 'number') {
       throw new Error('No active tab for work mode.');
     }
+    await resolvePreferredWorkFrame(targetTabId, transcript, false);
 
     const emitToolEvent = async (event) => {
       try {
@@ -680,9 +803,43 @@ async function handleWorkInstruction(transcript, tabId) {
       }
     };
 
+    const executeWithPreferredFrame = async ({ tabId, command, args, frameId, timeoutMs }) => {
+      const explicitFrame = typeof frameId === 'number';
+      const selectedFrame = explicitFrame ? frameId : appState.workPreferredFrameId;
+      let result = await executeExecutorCommandInTab({
+        tabId,
+        command,
+        args,
+        frameId: typeof selectedFrame === 'number' ? selectedFrame : undefined,
+        timeoutMs
+      });
+
+      if (!explicitFrame && result?.success === false && result?.errorCode === 'MESSAGE_DISPATCH_FAILED') {
+        const previousFrame = appState.workPreferredFrameId;
+        await resolvePreferredWorkFrame(tabId, transcript, true);
+        if (appState.workPreferredFrameId !== previousFrame) {
+          await safeSendRuntimeMessage({
+            type: 'STATUS_UPDATE',
+            level: 'info',
+            message:
+              `[work-frame] retrying ${command} on new frameId=${appState.workPreferredFrameId} ` +
+              `after dispatch failure on frameId=${previousFrame}`
+          });
+        }
+        result = await executeExecutorCommandInTab({
+          tabId,
+          command,
+          args,
+          frameId: typeof appState.workPreferredFrameId === 'number' ? appState.workPreferredFrameId : undefined,
+          timeoutMs
+        });
+      }
+      return result;
+    };
+
     const agent = await buildWorkAgent({
       tabId: targetTabId,
-      executeExecutorCommand: executeExecutorCommandInTab,
+      executeExecutorCommand: executeWithPreferredFrame,
       loadAllSkills,
       reportToolEvent: emitToolEvent,
       getSessionMemory: function () {
@@ -744,6 +901,9 @@ chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
     return;
   }
   if ((appState.mode === MODE_DEMO || appState.mode === MODE_WORK) && tabId === appState.activeTabId) {
+    if (appState.mode === MODE_WORK) {
+      appState.workPreferredFrameId = null;
+    }
     injectMainWorldScripts(tabId).catch(async (err) => {
       console.error('[sw] reinjection failed', err);
       await safeSendRuntimeMessage({
