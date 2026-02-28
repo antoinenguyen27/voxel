@@ -83,6 +83,11 @@
       lines.push(String(debug.actionsPreview));
       lines.push('');
     }
+    if (debug.pageContextPreview) {
+      lines.push('Page Context Preview:');
+      lines.push(String(debug.pageContextPreview));
+      lines.push('');
+    }
     if (debug.transcriptPreview) {
       lines.push('Plain Transcript Preview:');
       lines.push(String(debug.transcriptPreview));

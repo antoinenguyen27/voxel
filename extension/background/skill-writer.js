@@ -5,6 +5,7 @@ export const SKILL_WRITER_SYSTEM_PROMPT = `You write SKILL.md files for a browse
 You will be given a voice narration describing what the user intended, and a list of classified actions that were observed during that narration. The actions are already in executable form — your job is to select the meaningful ones (ignoring accidental or redundant actions), and write a skill that reproduces the user's intent.
 
 You may also receive timestamped transcript lines and timestamped action lines. Use temporal ordering to align intent with actions; prefer actions that occur near the narrated intent.
+You may also receive an initial page scaffold and local action context metadata. Use these only to disambiguate targets.
 
 The execution environment provides exactly these helpers, all async:
 - click(selector)
@@ -84,6 +85,83 @@ function formatRelativeTime(ts) {
   return `${(Math.max(0, ts) / 1000).toFixed(2)}s`;
 }
 
+function compactText(value, maxLen = 100) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return '';
+  }
+  return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}
+
+function formatMapNodes(nodes, maxItems = 12) {
+  const list = Array.isArray(nodes) ? nodes.slice(0, maxItems) : [];
+  if (!list.length) {
+    return 'none';
+  }
+  return list
+    .map((n) => {
+      const tag = n?.tag || 'element';
+      const selector = compactText(n?.selector || 'null', 80);
+      const label = compactText(n?.label || n?.text || '', 70);
+      return `${tag} selector=${selector}${label ? ` label="${label}"` : ''}`;
+    })
+    .join('\n');
+}
+
+function formatActionContext(ctx) {
+  if (!ctx || typeof ctx !== 'object') {
+    return '';
+  }
+  const selector = compactText(ctx.selector || '', 90);
+  const landmark = compactText(ctx.landmarkSelector || '', 90);
+  const parent = compactText(ctx.parentSelector || '', 90);
+  const tag = compactText(ctx.tag || '', 24);
+  const role = compactText(ctx.role || '', 24);
+  const frameUrl = compactText(ctx.frameUrl || '', 120);
+
+  const parts = [];
+  if (tag) parts.push(`tag=${tag}`);
+  if (role) parts.push(`role=${role}`);
+  if (selector) parts.push(`selector=${selector}`);
+  if (parent) parts.push(`parent=${parent}`);
+  if (landmark) parts.push(`landmark=${landmark}`);
+  if (frameUrl) parts.push(`frame=${frameUrl}`);
+  return parts.length ? ` | ctx: ${parts.join(' ')}` : '';
+}
+
+function formatPageContextForPrompt(pageContext) {
+  const summary = pageContext?.summary || null;
+  const zooms = Array.isArray(pageContext?.zooms) ? pageContext.zooms : [];
+  if (!summary && !zooms.length) {
+    return '';
+  }
+
+  const lines = [];
+  if (summary) {
+    lines.push(
+      `Initial page scaffold: title="${compactText(summary.title || '', 120)}" url="${compactText(summary.url || '', 180)}" focused="${compactText(summary.focusedSelector || 'null', 120)}" nodes=${summary.totalNodes || 0}`
+    );
+    lines.push(`Landmarks:\n${formatMapNodes(summary.landmarks, 10)}`);
+    lines.push(`Interactive candidates:\n${formatMapNodes(summary.interactive, 14)}`);
+  }
+
+  if (zooms.length) {
+    lines.push('Targeted zooms:');
+    for (const zoom of zooms.slice(0, 4)) {
+      const map = zoom?.map || {};
+      lines.push(
+        `- selector="${compactText(zoom?.selector || 'null', 140)}" found=${!!map.targetFound} title="${compactText(
+          map.title || '',
+          80
+        )}" nodes=${map.totalNodes || 0}`
+      );
+      lines.push(`  interactive:\n${formatMapNodes(map.interactive, 8)}`);
+    }
+  }
+
+  return lines.join('\n\n').trim();
+}
+
 export async function writeSkillFromSegment(transcript, actions, options = {}) {
   try {
     const apiKey = await getStoredApiKey('mistral');
@@ -93,13 +171,16 @@ export async function writeSkillFromSegment(transcript, actions, options = {}) {
 
     const transcriptTimeline = String(options?.transcriptTimeline || '').trim();
     const actionSummary = formatActionsForPrompt(actions || []);
+    const pageContextSummary = formatPageContextForPrompt(options?.pageContext || null);
     const voiceSection = transcriptTimeline
       ? `Voice narration (timestamped):\n${transcriptTimeline}\n\nVoice narration (plain): "${String(transcript || '')}"`
       : `Voice narration: "${String(transcript || '')}"`;
     const promptInput = {
       voiceSection,
-      observedActions: actionSummary
+      observedActions: actionSummary,
+      pageContext: pageContextSummary
     };
+    const pageContextSection = pageContextSummary ? `\n\nPage context map:\n${pageContextSummary}` : '';
 
     const response = await fetch(MISTRAL_CHAT_URL, {
       method: 'POST',
@@ -114,7 +195,7 @@ export async function writeSkillFromSegment(transcript, actions, options = {}) {
           { role: 'system', content: SKILL_WRITER_SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `${voiceSection}\n\nObserved actions (timestamped):\n${actionSummary}`
+            content: `${voiceSection}\n\nObserved actions (timestamped):\n${actionSummary}${pageContextSection}`
           }
         ]
       })
@@ -152,15 +233,15 @@ export function formatActionsForPrompt(actions) {
         const ts = `[${formatRelativeTime(a?.timestamp)}] `;
         switch (a?.action) {
           case 'click':
-            return `${ts}[click] ${a.tag || 'element'} | selector: ${a.selector} | label: "${a.ariaLabel || ''}" | text: "${a.innerText || ''}"`;
+            return `${ts}[click] ${a.tag || 'element'} | selector: ${a.selector} | label: "${a.ariaLabel || ''}" | text: "${a.innerText || ''}"${formatActionContext(a?.context)}`;
           case 'fill':
-            return `${ts}[fill] selector: ${a.selector} | label: "${a.ariaLabel || ''}" | value: "${a.value}"`;
+            return `${ts}[fill] selector: ${a.selector} | label: "${a.ariaLabel || ''}" | value: "${a.value}"${formatActionContext(a?.context)}`;
           case 'selectOptions':
-            return `${ts}[selectOptions] selector: ${a.selector} | value: "${a.value}"`;
+            return `${ts}[selectOptions] selector: ${a.selector} | value: "${a.value}"${formatActionContext(a?.context)}`;
           case 'keyboard':
-            return `${ts}[keyboard] type: ${a.eventType || 'keydown'} | key: ${a.key} | code: ${a.code || ''} | ctrl:${!!a.ctrlKey} meta:${!!a.metaKey} alt:${!!a.altKey} shift:${!!a.shiftKey}`;
+            return `${ts}[keyboard] type: ${a.eventType || 'keydown'} | key: ${a.key} | code: ${a.code || ''} | ctrl:${!!a.ctrlKey} meta:${!!a.metaKey} alt:${!!a.altKey} shift:${!!a.shiftKey}${formatActionContext(a?.context)}`;
           case 'network':
-            return `${ts}[network] ${a.method} ${a.url} → ${a.status}`;
+            return `${ts}[network] ${a.method} ${a.url} → ${a.status}${formatActionContext(a?.context)}`;
           default:
             return `${ts}${JSON.stringify(a)}`;
         }

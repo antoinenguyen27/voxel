@@ -13,6 +13,7 @@ const appState = {
   pendingBatch: [],
   demoStartedAt: 0,
   demoSegments: [],
+  demoPageScaffold: null,
   captureDiagnostics: {
     batchesReceived: 0,
     actionsReceived: 0,
@@ -69,6 +70,123 @@ function previewMultiline(text, maxLines = 14, maxChars = 1800) {
     preview += '\n…';
   }
   return preview;
+}
+
+function buildPageMapCode({ mode, targetSelector, depth, maxNodes }) {
+  const safeMode = mode === 'zoom' ? 'zoom' : 'summary';
+  const safeDepth = Number.isFinite(depth) ? Math.max(1, Math.min(7, depth)) : 4;
+  const safeMaxNodes = Number.isFinite(maxNodes) ? Math.max(20, Math.min(500, maxNodes)) : 180;
+
+  return `
+    const __uaMode = ${JSON.stringify(safeMode)};
+    const __uaTargetSelector = ${JSON.stringify(targetSelector || '')};
+    const __uaDepth = ${safeDepth};
+    const __uaMaxNodes = ${safeMaxNodes};
+
+    function __uaText(value, maxLen = 80) {
+      const text = String(value || '').replace(/\\s+/g, ' ').trim();
+      return text.length > maxLen ? text.slice(0, maxLen - 1) + '…' : text;
+    }
+
+    function __uaSelector(el) {
+      try {
+        if (window.__getStableSelector) {
+          return window.__getStableSelector(el);
+        }
+      } catch (_err) {}
+      return null;
+    }
+
+    function __uaInteractive(el) {
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName.toUpperCase();
+      if (['BUTTON', 'A', 'INPUT', 'TEXTAREA', 'SELECT', 'SUMMARY'].includes(tag)) return true;
+      const role = (el.getAttribute('role') || '').toLowerCase();
+      if (['button', 'link', 'textbox', 'checkbox', 'radio', 'menuitem', 'tab', 'option', 'combobox'].includes(role)) return true;
+      if (el.hasAttribute('contenteditable')) return true;
+      const tabIndex = el.getAttribute('tabindex');
+      return tabIndex !== null && tabIndex !== '-1';
+    }
+
+    function __uaNodeInfo(el, depthValue, path) {
+      const role = el.getAttribute('role') || null;
+      const label = el.getAttribute('aria-label') || el.getAttribute('name') || el.getAttribute('placeholder') || null;
+      return {
+        tag: el.tagName ? el.tagName.toLowerCase() : 'unknown',
+        role,
+        selector: __uaSelector(el),
+        text: __uaText(el.innerText || el.textContent || '', 100),
+        label: __uaText(label || '', 80),
+        depth: depthValue,
+        path,
+        interactive: __uaInteractive(el)
+      };
+    }
+
+    function __uaCollect(root, maxDepth, maxNodes) {
+      const nodes = [];
+      const queue = [{ el: root, depth: 0, path: '0' }];
+      while (queue.length && nodes.length < maxNodes) {
+        const current = queue.shift();
+        const el = current.el;
+        if (!el || !el.tagName) continue;
+        nodes.push(__uaNodeInfo(el, current.depth, current.path));
+        if (current.depth >= maxDepth) continue;
+        const children = Array.from(el.children || []);
+        for (let i = 0; i < children.length; i += 1) {
+          queue.push({ el: children[i], depth: current.depth + 1, path: current.path + '.' + i });
+          if (queue.length + nodes.length >= maxNodes * 2) break;
+        }
+      }
+      const interactive = nodes.filter((n) => n.interactive).slice(0, Math.floor(maxNodes * 0.6));
+      const landmarks = nodes.filter((n) => ['main', 'nav', 'section', 'form', 'table', 'header', 'footer', 'aside'].includes(n.tag) || n.role === 'dialog').slice(0, 80);
+      return { nodes, interactive, landmarks };
+    }
+
+    const __uaTopRoot = document.documentElement || document.body;
+    let __uaTarget = null;
+    if (__uaMode === 'zoom' && __uaTargetSelector) {
+      try { __uaTarget = document.querySelector(__uaTargetSelector); } catch (_err) { __uaTarget = null; }
+    }
+    const __uaBase = __uaTarget || __uaTopRoot;
+    const collect = __uaCollect(__uaBase, __uaDepth, __uaMaxNodes);
+
+    return {
+      mode: __uaMode,
+      url: window.location.href,
+      title: __uaText(document.title || '', 140),
+      focusedSelector: __uaSelector(document.activeElement),
+      targetSelector: __uaTargetSelector || null,
+      targetFound: !!__uaTarget,
+      totalNodes: collect.nodes.length,
+      landmarks: collect.landmarks,
+      interactive: collect.interactive
+    };
+  `;
+}
+
+async function captureDemoPageContext(tabId) {
+  if (typeof tabId !== 'number') {
+    return null;
+  }
+
+  try {
+    const summaryResult = await executePageCodeInTab({
+      tabId,
+      code: buildPageMapCode({ mode: 'summary', depth: 4, maxNodes: 220 })
+    });
+    if (!summaryResult?.success) {
+      return null;
+    }
+
+    return {
+      summary: summaryResult.output || null,
+      zooms: []
+    };
+  } catch (err) {
+    console.warn('[sw] captureDemoPageContext failed', err);
+    return null;
+  }
 }
 
 async function sendCaptureDiagStatus(message, level = 'info') {
@@ -262,10 +380,19 @@ async function startDemoMode(tabId) {
     appState.pendingBatch = [];
     appState.demoStartedAt = Date.now();
     appState.demoSegments = [];
+    appState.demoPageScaffold = null;
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
+    appState.demoPageScaffold = await captureDemoPageContext(tabId);
     scheduleFrameCoverageSweeps(tabId, MODE_DEMO);
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
     maybeSendCaptureDiagStatus(`capture pipeline armed for tab=${tabId}; waiting for ACTION_BATCH...`, 'info', true);
+    if (appState.demoPageScaffold?.summary) {
+      maybeSendCaptureDiagStatus(
+        `captured demo scaffold title="${truncateForLog(appState.demoPageScaffold.summary.title || '', 80)}" nodes=${appState.demoPageScaffold.summary.totalNodes || 0}`,
+        'info',
+        true
+      );
+    }
   } catch (err) {
     console.error('[sw] startDemoMode failed', err);
     appState.mode = MODE_IDLE;
@@ -319,6 +446,7 @@ async function stopDemoMode() {
         .filter(Boolean)
         .join('\n');
       const finalEvents = demoSegments.flatMap((segment) => (Array.isArray(segment.events) ? segment.events : []));
+      const pageContext = appState.demoPageScaffold || null;
 
       if (finalTranscript && finalEvents.length) {
         await safeSendRuntimeMessage({
@@ -327,7 +455,8 @@ async function stopDemoMode() {
           message: 'Generating skill from recorded demo...'
         });
         const skillResult = await writeSkillFromSegment(finalTranscript, finalEvents, {
-          transcriptTimeline
+          transcriptTimeline,
+          pageContext
         });
         const skillName = typeof skillResult === 'string' ? skillResult : skillResult?.skillName || `skill-${Date.now()}`;
         const skillContent = typeof skillResult === 'string' ? '' : skillResult?.skillText || '';
@@ -344,6 +473,7 @@ async function stopDemoMode() {
           debug: {
             transcriptTimelinePreview: previewMultiline(transcriptTimeline, 14, 1800),
             actionsPreview: previewMultiline(promptInput?.observedActions || '', 18, 2600),
+            pageContextPreview: previewMultiline(promptInput?.pageContext || '', 18, 2600),
             transcriptPreview: previewMultiline(finalTranscript, 8, 1000),
             actionCount: finalEvents.length,
             segmentCount: demoSegments.length
@@ -363,6 +493,7 @@ async function stopDemoMode() {
     appState.pendingBatch = [];
     appState.demoStartedAt = 0;
     appState.demoSegments = [];
+    appState.demoPageScaffold = null;
     maybeSendCaptureDiagStatus(
       `summary batches=${appState.captureDiagnostics.batchesReceived} actions=${appState.captureDiagnostics.actionsReceived} ignored=${appState.captureDiagnostics.ignoredBatches} byAction=${formatActionBreakdown(appState.captureDiagnostics.byAction)}`,
       'info',

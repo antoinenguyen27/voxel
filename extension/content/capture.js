@@ -38,6 +38,47 @@
     }
   }
 
+  function safeAttr(el, name) {
+    try {
+      return el && typeof el.getAttribute === 'function' ? el.getAttribute(name) : null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function captureElementContext(el) {
+    try {
+      if (!el || !el.tagName) {
+        return null;
+      }
+      var parent = el.parentElement || null;
+      var landmark = null;
+      if (typeof el.closest === 'function') {
+        landmark = el.closest(
+          'main,[role="main"],form,[role="form"],dialog,[role="dialog"],table,[role="grid"],[role="table"],nav,aside,header,footer,section'
+        );
+      }
+      return {
+        frameUrl: window.location.href,
+        tag: el.tagName.toLowerCase(),
+        role: safeAttr(el, 'role'),
+        ariaLabel: safeAttr(el, 'aria-label'),
+        name: safeAttr(el, 'name'),
+        placeholder: safeAttr(el, 'placeholder'),
+        inputType: safeAttr(el, 'type'),
+        isContentEditable: safeAttr(el, 'contenteditable') === 'true',
+        selector: window.__getStableSelector ? window.__getStableSelector(el) : null,
+        parentTag: parent && parent.tagName ? parent.tagName.toLowerCase() : null,
+        parentSelector: parent && window.__getStableSelector ? window.__getStableSelector(parent) : null,
+        landmarkTag: landmark && landmark.tagName ? landmark.tagName.toLowerCase() : null,
+        landmarkRole: landmark ? safeAttr(landmark, 'role') : null,
+        landmarkSelector: landmark && window.__getStableSelector ? window.__getStableSelector(landmark) : null
+      };
+    } catch (_err) {
+      return null;
+    }
+  }
+
   function recordAction(action) {
     try {
       if (!action || typeof action !== 'object') {
@@ -116,7 +157,8 @@
               action: 'fill',
               selector: window.__getStableSelector ? window.__getStableSelector(el) : null,
               ariaLabel: typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : null,
-              value: finalValue
+              value: finalValue,
+              context: captureElementContext(el)
             });
           }
         } catch (err) {
@@ -150,7 +192,8 @@
         ariaLabel: typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : null,
         role: typeof el.getAttribute === 'function' ? el.getAttribute('role') : null,
         tag: el.tagName.toLowerCase(),
-        innerText: el.innerText ? el.innerText.trim().slice(0, 60) : null
+        innerText: el.innerText ? el.innerText.trim().slice(0, 60) : null,
+        context: captureElementContext(el)
       });
     } catch (err) {
       console.error('[UA capture] onClick failed', err);
@@ -168,7 +211,8 @@
         action: 'selectOptions',
         selector: window.__getStableSelector ? window.__getStableSelector(el) : null,
         ariaLabel: typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : null,
-        value: el.value
+        value: el.value,
+        context: captureElementContext(el)
       });
     } catch (err) {
       console.error('[UA capture] onChange failed', err);
@@ -194,7 +238,8 @@
         metaKey: !!event.metaKey,
         altKey: !!event.altKey,
         shiftKey: !!event.shiftKey,
-        selector: window.__getStableSelector ? window.__getStableSelector(el) : null
+        selector: window.__getStableSelector ? window.__getStableSelector(el) : null,
+        context: captureElementContext(el)
       });
     } catch (err) {
       console.error('[UA capture] onKeydown failed', err);
@@ -219,7 +264,8 @@
         metaKey: false,
         altKey: false,
         shiftKey: false,
-        selector: window.__getStableSelector ? window.__getStableSelector(el) : null
+        selector: window.__getStableSelector ? window.__getStableSelector(el) : null,
+        context: captureElementContext(el)
       });
     } catch (err) {
       console.error('[UA capture] onComposition failed', err);
@@ -261,7 +307,14 @@
                 method: String(method).toUpperCase(),
                 url: url ? String(url).split('?')[0] : null,
                 body: bodyText,
-                status: result.status
+                status: result.status,
+                context: {
+                  frameUrl: window.location.href,
+                  activeSelector:
+                    window.__getStableSelector && document.activeElement
+                      ? window.__getStableSelector(document.activeElement)
+                      : null
+                }
               });
             }
           } catch (_err) {
@@ -305,7 +358,14 @@
                 method: method,
                 url: this.__ua_url ? String(this.__ua_url).split('?')[0] : null,
                 body: typeof body === 'string' ? body.slice(0, 500) : null,
-                status: this.status
+                status: this.status,
+                context: {
+                  frameUrl: window.location.href,
+                  activeSelector:
+                    window.__getStableSelector && document.activeElement
+                      ? window.__getStableSelector(document.activeElement)
+                      : null
+                }
               });
             } catch (_err) {
               // Keep XHR stable even if capture fails.
