@@ -6,6 +6,10 @@
     demoStream: null,
     demoChunks: [],
     demoTranscript: '',
+    demoTranscriptChunks: [],
+    demoStartedAt: 0,
+    demoSegmentStartedAt: 0,
+    demoSegmentEndedAt: 0,
     isDemoTranscribing: false,
     workRecorder: null,
     workStream: null,
@@ -205,6 +209,35 @@
     return left + '\n' + right;
   }
 
+  function formatChunkTimestamp(ts) {
+    try {
+      var startedAt = state.demoStartedAt || 0;
+      if (!ts || !startedAt) {
+        return 't+0.00s';
+      }
+      var elapsedMs = Math.max(0, ts - startedAt);
+      return 't+' + (elapsedMs / 1000).toFixed(2) + 's';
+    } catch (_err) {
+      return 't+0.00s';
+    }
+  }
+
+  function renderTranscriptChunks() {
+    try {
+      if (!Array.isArray(state.demoTranscriptChunks) || !state.demoTranscriptChunks.length) {
+        els.transcriptText.textContent = '';
+        return;
+      }
+      els.transcriptText.textContent = state.demoTranscriptChunks
+        .map(function (chunk) {
+          return '[' + formatChunkTimestamp(chunk.segmentEnd) + '] ' + String(chunk.text || '').trim();
+        })
+        .join('\n');
+    } catch (err) {
+      appendLog('renderTranscriptChunks failed: ' + err.message);
+    }
+  }
+
   function stopHeartbeat() {
     if (state.heartbeatTimer) {
       clearInterval(state.heartbeatTimer);
@@ -273,6 +306,10 @@
 
       state.demoChunks = [];
       state.demoTranscript = '';
+      state.demoTranscriptChunks = [];
+      if (!state.demoStartedAt) {
+        state.demoStartedAt = Date.now();
+      }
       state.demoRecorder = new MediaRecorder(state.demoStream, { mimeType: 'audio/webm' });
 
       state.demoRecorder.ondataavailable = function (event) {
@@ -302,15 +339,23 @@
           state.isDemoTranscribing = true;
           var transcript = await transcribeWithVoxtral(blob);
           if (transcript) {
+            var segmentStart = state.demoSegmentStartedAt || Date.now();
+            var segmentEnd = state.demoSegmentEndedAt || Date.now();
             state.demoTranscript = appendTranscript(state.demoTranscript, transcript);
-            els.transcriptText.textContent = state.demoTranscript;
+            state.demoTranscriptChunks.push({
+              text: transcript,
+              segmentStart: segmentStart,
+              segmentEnd: segmentEnd
+            });
+            renderTranscriptChunks();
             appendLog('Demo transcript: ' + transcript);
             try {
               await sendRuntimeMessage({
                 type: 'VOICE_SEGMENT',
                 transcript: transcript,
                 fullTranscript: state.demoTranscript,
-                segmentEnd: Date.now()
+                segmentStart: segmentStart,
+                segmentEnd: segmentEnd
               });
             } catch (err) {
               appendLog('VOICE_SEGMENT failed: ' + err.message);
@@ -324,9 +369,12 @@
           state.isDemoTranscribing = false;
           if (state.mode === 'demo' && state.demoRecorder && state.demoRecorder.state === 'inactive') {
             try {
+              state.demoSegmentStartedAt = Date.now();
+              state.demoSegmentEndedAt = 0;
               state.demoRecorder.start();
               setTimeout(function () {
                 if (state.mode === 'demo' && state.demoRecorder && state.demoRecorder.state === 'recording') {
+                  state.demoSegmentEndedAt = Date.now();
                   state.demoRecorder.stop();
                 }
               }, 4500);
@@ -337,9 +385,12 @@
         }
       };
 
+      state.demoSegmentStartedAt = Date.now();
+      state.demoSegmentEndedAt = 0;
       state.demoRecorder.start();
       setTimeout(function () {
         if (state.mode === 'demo' && state.demoRecorder && state.demoRecorder.state === 'recording') {
+          state.demoSegmentEndedAt = Date.now();
           state.demoRecorder.stop();
         }
       }, 4500);
@@ -375,6 +426,10 @@
     state.demoStream = null;
     state.demoChunks = [];
     state.demoTranscript = '';
+    state.demoTranscriptChunks = [];
+    state.demoStartedAt = 0;
+    state.demoSegmentStartedAt = 0;
+    state.demoSegmentEndedAt = 0;
     state.isDemoTranscribing = false;
   }
 
@@ -528,6 +583,8 @@
 
       state.mode = 'demo';
       state.demoTranscript = '';
+      state.demoTranscriptChunks = [];
+      state.demoStartedAt = Date.now();
       els.transcriptText.textContent = '';
       updateButtons();
       setStatus('Demo recording...', 'busy');

@@ -117,19 +117,29 @@ export async function writeSkillFromSegment(transcript, events) {
 
 export function formatEventsForPrompt(events) {
   try {
+    function formatTs(ts) {
+      if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+        return 'unknown-time';
+      }
+      if (ts >= 0 && ts < 24 * 60 * 60 * 1000) {
+        return `t+${(ts / 1000).toFixed(2)}s`;
+      }
+      return new Date(ts).toISOString();
+    }
+
     return (events || [])
       .map((e) => {
         if (e?.type === 'DOM_EVENT') {
-          return `[${e.eventType}] ${e.tag} | selector: ${e.selector} | label: ${e.ariaLabel} | value: ${e.value} | confidence: ${e.confidence}`;
+          return `[${formatTs(e.timestamp)}] [${e.eventType}] ${e.tag} | selector: ${e.selector} | label: ${e.ariaLabel} | value: ${e.value} | confidence: ${e.confidence}`;
         }
         if (e?.type === 'DOM_MUTATION') {
           const summary = Array.isArray(e.summary)
             ? e.summary.map((s) => `${s.kind} on ${s.target}`).join(', ')
             : '';
-          return `[mutation] ${e.count} changes | ${summary}`;
+          return `[${formatTs(e.timestamp)}] [mutation] ${e.count} changes | ${summary}`;
         }
         if (e?.type === 'NETWORK_FETCH' || e?.type === 'NETWORK_XHR') {
-          return `[network] ${e.method} ${e.url} → ${e.status}`;
+          return `[${formatTs(e.timestamp)}] [network] ${e.method} ${e.url} → ${e.status}`;
         }
         return JSON.stringify(e);
       })

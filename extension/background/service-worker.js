@@ -9,7 +9,8 @@ const appState = {
   mode: MODE_IDLE,
   activeTabId: null,
   sessionMemory: [],
-  pendingBatch: []
+  pendingBatch: [],
+  demoStartedAt: 0
 };
 
 const pendingExecutions = new Map();
@@ -125,6 +126,7 @@ async function startDemoMode(tabId) {
     appState.mode = MODE_DEMO;
     appState.activeTabId = tabId;
     appState.pendingBatch = [];
+    appState.demoStartedAt = Date.now();
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
   } catch (err) {
@@ -141,6 +143,7 @@ async function stopDemoMode() {
     appState.mode = MODE_IDLE;
     appState.activeTabId = null;
     appState.pendingBatch = [];
+    appState.demoStartedAt = 0;
     await safeSendTabMessage(tabId, { type: 'STOP_CAPTURE' });
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode stopped.' });
   } catch (err) {
@@ -157,7 +160,41 @@ function handleActionBatch(message) {
     if (!Array.isArray(message.events)) {
       return;
     }
-    appState.pendingBatch.push(...message.events);
+    const demoStartedAt = appState.demoStartedAt || Date.now();
+    const fallbackTimestamp = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
+    const normalizedEvents = message.events.map((event) => {
+      const sourceTimestamp = typeof event?.timestamp === 'number' ? event.timestamp : fallbackTimestamp;
+      const relativeTimestamp = Math.max(0, sourceTimestamp - demoStartedAt);
+      if (event && typeof event === 'object' && typeof event.timestamp !== 'number') {
+        return {
+          ...event,
+          timestamp: relativeTimestamp
+        };
+      }
+      if (event && typeof event === 'object') {
+        return {
+          ...event,
+          timestamp: relativeTimestamp
+        };
+      }
+      return event;
+    });
+    appState.pendingBatch.push(...normalizedEvents);
+
+    const mutationEvents = normalizedEvents.filter((event) => event && event.type === 'DOM_MUTATION');
+    if (mutationEvents.length) {
+      const sample = mutationEvents[mutationEvents.length - 1];
+      const sampleSummary = Array.isArray(sample.summary)
+        ? sample.summary.map((s) => `${s.kind} on ${s.target}`).join(', ')
+        : '';
+      safeSendRuntimeMessage({
+        type: 'STATUS_UPDATE',
+        level: 'info',
+        message:
+          `[DOM t+${(sample.timestamp / 1000).toFixed(2)}s] ${mutationEvents.length} mutation event(s)` +
+          (sampleSummary ? ` | ${sampleSummary}` : '')
+      }).catch(() => {});
+    }
   } catch (err) {
     console.error('[sw] handleActionBatch failed', err);
   }
@@ -174,7 +211,36 @@ async function handleVoiceSegment(message) {
       return { ok: false, skipped: true, reason: 'Empty transcript.' };
     }
 
-    const events = appState.pendingBatch.splice(0, appState.pendingBatch.length);
+    const segmentEndAbsolute =
+      typeof message.segmentEnd === 'number' && Number.isFinite(message.segmentEnd) ? message.segmentEnd : null;
+    const segmentEnd =
+      segmentEndAbsolute === null
+        ? null
+        : Math.max(0, segmentEndAbsolute - (appState.demoStartedAt || segmentEndAbsolute));
+
+    let events = [];
+    if (segmentEnd === null) {
+      events = appState.pendingBatch.splice(0, appState.pendingBatch.length);
+    } else {
+      const toProcess = [];
+      const keepForNextSegment = [];
+      for (const event of appState.pendingBatch) {
+        const ts = typeof event?.timestamp === 'number' ? event.timestamp : 0;
+        if (ts > 0 && ts <= segmentEnd) {
+          toProcess.push(event);
+        } else if (ts === 0) {
+          toProcess.push({
+            ...event,
+            timestamp: segmentEnd
+          });
+        } else {
+          keepForNextSegment.push(event);
+        }
+      }
+      appState.pendingBatch = keepForNextSegment;
+      events = toProcess;
+    }
+
     if (!events.length) {
       return { ok: true, skipped: true, reason: 'No captured events for segment.' };
     }

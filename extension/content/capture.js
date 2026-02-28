@@ -258,6 +258,8 @@
           document.removeEventListener(evt, eventHandler, true);
         } catch (_err) {}
       });
+      // Flush pending events so the final segment does not lose trailing actions.
+      flush();
       if (mutationObserver) {
         mutationObserver.disconnect();
       }
