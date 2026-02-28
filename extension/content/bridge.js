@@ -45,7 +45,13 @@
 
   chrome.runtime.onMessage.addListener(function (message) {
     try {
-      if (!message || (message.type !== 'EXECUTE_CODE' && message.type !== 'PING' && message.type !== 'STOP_CAPTURE')) {
+      if (
+        !message ||
+        (message.type !== 'EXECUTOR_COMMAND' &&
+          message.type !== 'EXECUTE_CODE' &&
+          message.type !== 'PING' &&
+          message.type !== 'STOP_CAPTURE')
+      ) {
         return;
       }
 
@@ -53,6 +59,8 @@
         __universalAgent: true,
         type: message.type,
         code: message.code,
+        command: message.command,
+        args: message.args,
         executionId: message.executionId
       });
     } catch (err) {
