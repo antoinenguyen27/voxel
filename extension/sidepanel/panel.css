@@ -1,0 +1,88 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f6f8fb;
+  color: #1b2430;
+}
+
+.panel {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  border: 1px solid #d0d8e2;
+  background: #ffffff;
+  color: #1b2430;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #9aa4b2;
+}
+
+.dot.ready {
+  background: #0a7f3f;
+}
+
+.dot.busy {
+  background: #c08b00;
+}
+
+.dot.error {
+  background: #cb1f27;
+}
+
+.transcript,
+.logs {
+  border: 1px solid #dbe3ec;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px;
+}
+
+pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+  font-size: 12px;
+}

@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Universal Agent",
+  "version": "1.0.0",
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "tabs", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "dist/background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dist/content/bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "side_panel": {
+    "default_path": "dist/sidepanel/panel.html"
+  },
+  "options_page": "options/options.html",
+  "action": {
+    "default_title": "Universal Agent"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "dist/content/capture.js",
+        "dist/content/executor.js",
+        "dist/lib/selector.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
