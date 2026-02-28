@@ -656,10 +656,35 @@ async function handleWorkInstruction(transcript, tabId) {
       throw new Error('No active tab for work mode.');
     }
 
+    const emitToolEvent = async (event) => {
+      try {
+        const phase = event?.phase === 'finish' ? 'finish' : 'start';
+        const tool = event?.tool || 'unknown_tool';
+        if (phase === 'start') {
+          await safeSendRuntimeMessage({
+            type: 'STATUS_UPDATE',
+            level: 'info',
+            message: `[work-tool] ${tool} start input=${truncateForLog(JSON.stringify(event?.input || {}), 320)}`
+          });
+          return;
+        }
+        await safeSendRuntimeMessage({
+          type: 'STATUS_UPDATE',
+          level: event?.ok ? 'info' : 'error',
+          message:
+            `[work-tool] ${tool} finish ${event?.summary || ''}` +
+            ` output=${truncateForLog(String(event?.outputPreview || ''), 320)}`
+        });
+      } catch (err) {
+        console.error('[sw] emitToolEvent failed', err);
+      }
+    };
+
     const agent = await buildWorkAgent({
       tabId: targetTabId,
       executeExecutorCommand: executeExecutorCommandInTab,
       loadAllSkills,
+      reportToolEvent: emitToolEvent,
       getSessionMemory: function () {
         return appState.sessionMemory.slice();
       }

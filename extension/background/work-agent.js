@@ -105,7 +105,25 @@ function formatCommandError(result, fallback) {
   return `Error${code}: ${result?.error || fallback}`;
 }
 
-export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSkills, getSessionMemory }) {
+function toPreview(value, maxChars = 420) {
+  const text = (() => {
+    try {
+      return JSON.stringify(value == null ? {} : value);
+    } catch (_err) {
+      return String(value);
+    }
+  })();
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return text.slice(0, maxChars - 1) + '…';
+}
+
+function toolStatus(ok, details) {
+  return ok ? `ok ${details || ''}`.trim() : `error ${details || ''}`.trim();
+}
+
+export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSkills, getSessionMemory, reportToolEvent }) {
   const apiKey = await getStoredApiKey('mistral');
   if (!apiKey) {
     throw new Error('Missing Mistral API key. Set it in extension options.');
@@ -119,6 +137,12 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
 
   const inspectPageMapTool = tool(
     async ({ mode, targetSelector, depth, maxNodes, frameId }) => {
+      const toolName = 'inspect_page_map';
+      await reportToolEvent?.({
+        phase: 'start',
+        tool: toolName,
+        input: { mode, targetSelector, depth, maxNodes, frameId }
+      });
       try {
         const result = await executeExecutorCommand({
           tabId,
@@ -127,11 +151,35 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
           frameId
         });
         if (!result || !result.success) {
-          return formatCommandError(result, 'inspection failed');
+          const errorMessage = formatCommandError(result, 'inspection failed');
+          await reportToolEvent?.({
+            phase: 'finish',
+            tool: toolName,
+            ok: false,
+            summary: toolStatus(false, result?.errorCode || result?.error || 'inspection failed'),
+            outputPreview: toPreview({ error: errorMessage })
+          });
+          return errorMessage;
         }
-        return toJsonPreview(result.output);
+        const output = toJsonPreview(result.output);
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: true,
+          summary: toolStatus(true, 'inspection complete'),
+          outputPreview: toPreview(result.output)
+        });
+        return output;
       } catch (err) {
-        return `Error inspecting page map: ${err && err.message ? err.message : String(err)}`;
+        const errorMessage = `Error inspecting page map: ${err && err.message ? err.message : String(err)}`;
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: false,
+          summary: toolStatus(false, err && err.message ? err.message : String(err)),
+          outputPreview: toPreview({ error: errorMessage })
+        });
+        return errorMessage;
       }
     },
     {
@@ -150,6 +198,12 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
 
   const getActionContextTool = tool(
     async ({ selector, radius, maxSiblings, maxChildren, frameId }) => {
+      const toolName = 'get_action_context';
+      await reportToolEvent?.({
+        phase: 'start',
+        tool: toolName,
+        input: { selector, radius, maxSiblings, maxChildren, frameId }
+      });
       try {
         const result = await executeExecutorCommand({
           tabId,
@@ -158,11 +212,35 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
           frameId
         });
         if (!result || !result.success) {
-          return formatCommandError(result, 'action context inspection failed');
+          const errorMessage = formatCommandError(result, 'action context inspection failed');
+          await reportToolEvent?.({
+            phase: 'finish',
+            tool: toolName,
+            ok: false,
+            summary: toolStatus(false, result?.errorCode || result?.error || 'action context failed'),
+            outputPreview: toPreview({ error: errorMessage })
+          });
+          return errorMessage;
         }
-        return toJsonPreview(result.output);
+        const output = toJsonPreview(result.output);
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: true,
+          summary: toolStatus(true, 'context captured'),
+          outputPreview: toPreview(result.output)
+        });
+        return output;
       } catch (err) {
-        return `Error getting action context: ${err && err.message ? err.message : String(err)}`;
+        const errorMessage = `Error getting action context: ${err && err.message ? err.message : String(err)}`;
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: false,
+          summary: toolStatus(false, err && err.message ? err.message : String(err)),
+          outputPreview: toPreview({ error: errorMessage })
+        });
+        return errorMessage;
       }
     },
     {
@@ -181,6 +259,12 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
 
   const executeActionsTool = tool(
     async ({ summary, actions, frameId }) => {
+      const toolName = 'execute_actions';
+      await reportToolEvent?.({
+        phase: 'start',
+        tool: toolName,
+        input: { summary, actionsCount: Array.isArray(actions) ? actions.length : 0, frameId, actions }
+      });
       try {
         const result = await executeExecutorCommand({
           tabId,
@@ -189,11 +273,35 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
           frameId
         });
         if (!result || !result.success) {
-          return formatCommandError(result, 'action execution failed');
+          const errorMessage = formatCommandError(result, 'action execution failed');
+          await reportToolEvent?.({
+            phase: 'finish',
+            tool: toolName,
+            ok: false,
+            summary: toolStatus(false, result?.errorCode || result?.error || 'actions failed'),
+            outputPreview: toPreview({ error: errorMessage })
+          });
+          return errorMessage;
         }
-        return toJsonPreview(result.output);
+        const output = toJsonPreview(result.output);
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: true,
+          summary: toolStatus(true, 'actions complete'),
+          outputPreview: toPreview(result.output)
+        });
+        return output;
       } catch (err) {
-        return `Error running actions: ${err && err.message ? err.message : String(err)}`;
+        const errorMessage = `Error running actions: ${err && err.message ? err.message : String(err)}`;
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: false,
+          summary: toolStatus(false, err && err.message ? err.message : String(err)),
+          outputPreview: toPreview({ error: errorMessage })
+        });
+        return errorMessage;
       }
     },
     {
@@ -210,10 +318,24 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
 
   const readSkillsTool = tool(
     async ({ query }) => {
+      const toolName = 'read_skills';
+      await reportToolEvent?.({
+        phase: 'start',
+        tool: toolName,
+        input: { query }
+      });
       try {
         const skills = await loadAllSkills();
         if (!skills.length) {
-          return 'No skills recorded yet.';
+          const output = 'No skills recorded yet.';
+          await reportToolEvent?.({
+            phase: 'finish',
+            tool: toolName,
+            ok: true,
+            summary: toolStatus(true, '0 skills'),
+            outputPreview: toPreview(output)
+          });
+          return output;
         }
         const queryWords = String(query || '')
           .toLowerCase()
@@ -227,12 +349,36 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
         });
 
         if (relevant.length > 0) {
-          return relevant.map((s) => `## ${s.name}\n${s.content}`).join('\n\n---\n\n');
+          const output = relevant.map((s) => `## ${s.name}\n${s.content}`).join('\n\n---\n\n');
+          await reportToolEvent?.({
+            phase: 'finish',
+            tool: toolName,
+            ok: true,
+            summary: toolStatus(true, `${relevant.length} relevant of ${skills.length}`),
+            outputPreview: toPreview(output)
+          });
+          return output;
         }
 
-        return `No relevant skills found for: ${query}. Available: ${skills.map((s) => s.name).join(', ')}`;
+        const fallback = `No relevant skills found for: ${query}. Available: ${skills.map((s) => s.name).join(', ')}`;
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: true,
+          summary: toolStatus(true, `0 relevant of ${skills.length}`),
+          outputPreview: toPreview(fallback)
+        });
+        return fallback;
       } catch (err) {
-        return `Error reading skills: ${err && err.message ? err.message : String(err)}`;
+        const errorMessage = `Error reading skills: ${err && err.message ? err.message : String(err)}`;
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: false,
+          summary: toolStatus(false, err && err.message ? err.message : String(err)),
+          outputPreview: toPreview({ error: errorMessage })
+        });
+        return errorMessage;
       }
     },
     {
@@ -246,11 +392,33 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
 
   const readMemoryTool = tool(
     async () => {
+      const toolName = 'read_session_memory';
+      await reportToolEvent?.({
+        phase: 'start',
+        tool: toolName,
+        input: {}
+      });
       try {
         const memory = getSessionMemory();
-        return formatMemory(memory);
+        const output = formatMemory(memory);
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: true,
+          summary: toolStatus(true, `${Array.isArray(memory) ? memory.length : 0} entries`),
+          outputPreview: toPreview(output)
+        });
+        return output;
       } catch (err) {
-        return `Error reading session memory: ${err && err.message ? err.message : String(err)}`;
+        const errorMessage = `Error reading session memory: ${err && err.message ? err.message : String(err)}`;
+        await reportToolEvent?.({
+          phase: 'finish',
+          tool: toolName,
+          ok: false,
+          summary: toolStatus(false, err && err.message ? err.message : String(err)),
+          outputPreview: toPreview({ error: errorMessage })
+        });
+        return errorMessage;
       }
     },
     {
