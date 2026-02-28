@@ -4,6 +4,7 @@ import { buildWorkAgent } from './work-agent.js';
 const MODE_IDLE = 'idle';
 const MODE_DEMO = 'demo';
 const MODE_WORK = 'work';
+const FRAME_SWEEP_DELAYS_MS = [1200, 3500, 8000];
 
 const appState = {
   mode: MODE_IDLE,
@@ -72,7 +73,7 @@ function formatActionDetail(actionRecord) {
     case 'selectOptions':
       return `selectOptions selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" value="${truncateForLog(actionRecord?.value || '', 100)}"`;
     case 'keyboard':
-      return `keyboard key="${truncateForLog(actionRecord?.key || '', 40)}" selector="${truncateForLog(actionRecord?.selector || 'null', 120)}"`;
+      return `keyboard type="${truncateForLog(actionRecord?.eventType || 'keydown', 40)}" key="${truncateForLog(actionRecord?.key || '', 40)}" code="${truncateForLog(actionRecord?.code || '', 40)}" ctrl=${!!actionRecord?.ctrlKey} meta=${!!actionRecord?.metaKey} alt=${!!actionRecord?.altKey} shift=${!!actionRecord?.shiftKey} selector="${truncateForLog(actionRecord?.selector || 'null', 120)}"`;
     case 'network':
       return `network method="${truncateForLog(actionRecord?.method || '', 10)}" url="${truncateForLog(actionRecord?.url || '', 160)}" status="${truncateForLog(actionRecord?.status || '', 10)}"`;
     default:
@@ -88,6 +89,47 @@ function maybeSendCaptureDiagStatus(message, level = 'info', force = false) {
   }
   appState.captureDiagnostics.lastStatusAt = now;
   sendCaptureDiagStatus(message, level).catch(() => {});
+}
+
+async function injectAllFramesSweep(tabId, reason) {
+  try {
+    await getInjectableTab(tabId);
+    const prefix = getScriptPrefix();
+    const files = [`${prefix}lib/selector.js`, `${prefix}content/capture.js`, `${prefix}content/executor.js`];
+
+    for (const file of files) {
+      await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          files: [file],
+          world: 'MAIN'
+        }),
+        3500,
+        `${reason} ${file} allFrames sweep`
+      );
+    }
+    maybeSendCaptureDiagStatus(`frame sweep success (${reason}) on tab=${tabId}`, 'info');
+  } catch (err) {
+    maybeSendCaptureDiagStatus(
+      `frame sweep partial/failed (${reason}) on tab=${tabId}: ${err && err.message ? err.message : String(err)}`,
+      'info'
+    );
+  }
+}
+
+function scheduleFrameCoverageSweeps(tabId, mode) {
+  for (let i = 0; i < FRAME_SWEEP_DELAYS_MS.length; i += 1) {
+    const delayMs = FRAME_SWEEP_DELAYS_MS[i];
+    setTimeout(() => {
+      if (appState.mode !== mode) {
+        return;
+      }
+      if (appState.activeTabId !== tabId) {
+        return;
+      }
+      injectAllFramesSweep(tabId, `${mode}#${i + 1}`).catch(() => {});
+    }, delayMs);
+  }
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -205,6 +247,7 @@ async function startDemoMode(tabId) {
     appState.demoStartedAt = Date.now();
     appState.demoSegments = [];
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
+    scheduleFrameCoverageSweeps(tabId, MODE_DEMO);
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
     maybeSendCaptureDiagStatus(`capture pipeline armed for tab=${tabId}; waiting for ACTION_BATCH...`, 'info', true);
   } catch (err) {
@@ -424,6 +467,7 @@ async function startWorkMode(tabId) {
     appState.activeTabId = tabId;
     appState.sessionMemory = [];
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Work injection');
+    scheduleFrameCoverageSweeps(tabId, MODE_WORK);
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Work mode started.' });
   } catch (err) {
     console.error('[sw] startWorkMode failed', err);

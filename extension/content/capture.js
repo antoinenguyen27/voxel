@@ -140,9 +140,6 @@
       if (!el || !el.tagName || el.tagName === 'BODY' || el.tagName === 'HTML') {
         return;
       }
-      if (isTextField(el)) {
-        return;
-      }
       if (typeof el.closest === 'function' && el.closest('[data-universal-agent-ui]')) {
         return;
       }
@@ -181,22 +178,51 @@
   function onKeydown(event) {
     try {
       var el = event.target;
-      if (isTextField(el)) {
-        return;
-      }
-
-      var meaningful = ['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown'];
-      if (meaningful.indexOf(event.key) === -1) {
+      var key = event.key || '';
+      // Capture all keydown events so IME/editor flows (including key="Process")
+      // are observable in diagnostics and downstream action selection.
+      if (!key && !event.code) {
         return;
       }
 
       recordAction({
         action: 'keyboard',
-        key: event.key,
+        eventType: 'keydown',
+        key: key,
+        code: event.code || null,
+        ctrlKey: !!event.ctrlKey,
+        metaKey: !!event.metaKey,
+        altKey: !!event.altKey,
+        shiftKey: !!event.shiftKey,
         selector: window.__getStableSelector ? window.__getStableSelector(el) : null
       });
     } catch (err) {
       console.error('[UA capture] onKeydown failed', err);
+    }
+  }
+
+  function onComposition(event) {
+    try {
+      var el = event.target;
+      if (!el || !el.tagName || el.tagName === 'BODY' || el.tagName === 'HTML') {
+        return;
+      }
+
+      var eventType = event.type || 'compositionupdate';
+      var text = event && typeof event.data === 'string' ? event.data : '';
+      recordAction({
+        action: 'keyboard',
+        eventType: eventType,
+        key: text || eventType,
+        code: null,
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+        shiftKey: false,
+        selector: window.__getStableSelector ? window.__getStableSelector(el) : null
+      });
+    } catch (err) {
+      console.error('[UA capture] onComposition failed', err);
     }
   }
 
@@ -299,6 +325,9 @@
   document.addEventListener('click', onClick, true);
   document.addEventListener('change', onChange, true);
   document.addEventListener('keydown', onKeydown, true);
+  document.addEventListener('compositionstart', onComposition, true);
+  document.addEventListener('compositionupdate', onComposition, true);
+  document.addEventListener('compositionend', onComposition, true);
 
   patchNetwork();
 
@@ -320,6 +349,9 @@
       document.removeEventListener('click', onClick, true);
       document.removeEventListener('change', onChange, true);
       document.removeEventListener('keydown', onKeydown, true);
+      document.removeEventListener('compositionstart', onComposition, true);
+      document.removeEventListener('compositionupdate', onComposition, true);
+      document.removeEventListener('compositionend', onComposition, true);
 
       trackedInputElements.forEach(function (el) {
         var state = inputBuffers.get(el);
