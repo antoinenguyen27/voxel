@@ -122,7 +122,7 @@ export function formatEventsForPrompt(events) {
         return 'unknown-time';
       }
       if (ts >= 0 && ts < 24 * 60 * 60 * 1000) {
-        return `t+${(ts / 1000).toFixed(2)}s`;
+        return `${(ts / 1000).toFixed(2)}s`;
       }
       return new Date(ts).toISOString();
     }

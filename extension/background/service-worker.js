@@ -10,7 +10,8 @@ const appState = {
   activeTabId: null,
   sessionMemory: [],
   pendingBatch: [],
-  demoStartedAt: 0
+  demoStartedAt: 0,
+  demoSegments: []
 };
 
 const pendingExecutions = new Map();
@@ -127,6 +128,7 @@ async function startDemoMode(tabId) {
     appState.activeTabId = tabId;
     appState.pendingBatch = [];
     appState.demoStartedAt = Date.now();
+    appState.demoSegments = [];
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
   } catch (err) {
@@ -140,11 +142,54 @@ async function startDemoMode(tabId) {
 async function stopDemoMode() {
   try {
     const tabId = appState.activeTabId;
+    await safeSendTabMessage(tabId, { type: 'STOP_CAPTURE' });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const demoSegments = appState.demoSegments.slice();
+    const trailingEvents = appState.pendingBatch.slice();
+
+    if (demoSegments.length || trailingEvents.length) {
+      if (trailingEvents.length) {
+        if (demoSegments.length) {
+          const last = demoSegments[demoSegments.length - 1];
+          last.events = (last.events || []).concat(trailingEvents);
+        } else {
+          demoSegments.push({
+            transcript: '[No transcript captured]',
+            segmentStart: 0,
+            segmentEnd: trailingEvents[trailingEvents.length - 1]?.timestamp || 0,
+            events: trailingEvents
+          });
+        }
+      }
+
+      const finalTranscript = demoSegments
+        .map((segment) => String(segment.transcript || '').trim())
+        .filter(Boolean)
+        .join('\n');
+      const finalEvents = demoSegments.flatMap((segment) => (Array.isArray(segment.events) ? segment.events : []));
+
+      if (finalTranscript && finalEvents.length) {
+        const skillName = await writeSkillFromSegment(finalTranscript, finalEvents);
+        await safeSendRuntimeMessage({
+          type: 'STATUS_UPDATE',
+          level: 'success',
+          message: `Saved skill: ${skillName}`
+        });
+      } else {
+        await safeSendRuntimeMessage({
+          type: 'STATUS_UPDATE',
+          level: 'info',
+          message: 'Demo stopped with no complete transcript+event payload to process.'
+        });
+      }
+    }
+
     appState.mode = MODE_IDLE;
     appState.activeTabId = null;
     appState.pendingBatch = [];
     appState.demoStartedAt = 0;
-    await safeSendTabMessage(tabId, { type: 'STOP_CAPTURE' });
+    appState.demoSegments = [];
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode stopped.' });
   } catch (err) {
     console.error('[sw] stopDemoMode failed', err);
@@ -191,7 +236,7 @@ function handleActionBatch(message) {
         type: 'STATUS_UPDATE',
         level: 'info',
         message:
-          `[DOM t+${(sample.timestamp / 1000).toFixed(2)}s] ${mutationEvents.length} mutation event(s)` +
+          `[DOM ${(sample.timestamp / 1000).toFixed(2)}s] ${mutationEvents.length} mutation event(s)` +
           (sampleSummary ? ` | ${sampleSummary}` : '')
       }).catch(() => {});
     }
@@ -241,17 +286,19 @@ async function handleVoiceSegment(message) {
       events = toProcess;
     }
 
-    if (!events.length) {
-      return { ok: true, skipped: true, reason: 'No captured events for segment.' };
-    }
-
-    const skillName = await writeSkillFromSegment(transcript, events);
-    await safeSendRuntimeMessage({
-      type: 'STATUS_UPDATE',
-      level: 'success',
-      message: `Saved skill: ${skillName}`
+    appState.demoSegments.push({
+      transcript,
+      segmentStart: typeof message.segmentStart === 'number' ? message.segmentStart : null,
+      segmentEnd: segmentEnd,
+      events
     });
-    return { ok: true, skillName };
+
+    return {
+      ok: true,
+      buffered: true,
+      segmentCount: appState.demoSegments.length,
+      eventCount: events.length
+    };
   } catch (err) {
     console.error('[sw] handleVoiceSegment failed', err);
     await safeSendRuntimeMessage({

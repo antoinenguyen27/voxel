@@ -213,12 +213,12 @@
     try {
       var startedAt = state.demoStartedAt || 0;
       if (!ts || !startedAt) {
-        return 't+0.00s';
+        return '0.00s';
       }
       var elapsedMs = Math.max(0, ts - startedAt);
-      return 't+' + (elapsedMs / 1000).toFixed(2) + 's';
+      return (elapsedMs / 1000).toFixed(2) + 's';
     } catch (_err) {
-      return 't+0.00s';
+      return '0.00s';
     }
   }
 
