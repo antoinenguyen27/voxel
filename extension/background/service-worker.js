@@ -11,10 +11,84 @@ const appState = {
   sessionMemory: [],
   pendingBatch: [],
   demoStartedAt: 0,
-  demoSegments: []
+  demoSegments: [],
+  captureDiagnostics: {
+    batchesReceived: 0,
+    actionsReceived: 0,
+    ignoredBatches: 0,
+    byAction: {},
+    lastStatusAt: 0
+  }
 };
 
 const pendingExecutions = new Map();
+
+function resetCaptureDiagnostics() {
+  appState.captureDiagnostics = {
+    batchesReceived: 0,
+    actionsReceived: 0,
+    ignoredBatches: 0,
+    byAction: {},
+    lastStatusAt: 0
+  };
+}
+
+function formatActionBreakdown(counts) {
+  const entries = Object.entries(counts || {}).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) {
+    return 'none';
+  }
+  return entries.map(([key, value]) => `${key}:${value}`).join(', ');
+}
+
+function truncateForLog(value, max = 80) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (text.length <= max) {
+    return text;
+  }
+  return `${text.slice(0, max - 1)}…`;
+}
+
+function formatRelativeTime(ms) {
+  const value = typeof ms === 'number' && Number.isFinite(ms) ? Math.max(0, ms) : 0;
+  return `${(value / 1000).toFixed(2)}s`;
+}
+
+async function sendCaptureDiagStatus(message, level = 'info') {
+  await safeSendRuntimeMessage({
+    type: 'STATUS_UPDATE',
+    level,
+    message: `[capture-diag] ${message}`
+  });
+}
+
+function formatActionDetail(actionRecord) {
+  const action = actionRecord?.action || 'unknown';
+  switch (action) {
+    case 'click':
+      return `click selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" tag="${truncateForLog(actionRecord?.tag || '', 40)}" label="${truncateForLog(actionRecord?.ariaLabel || '', 80)}" text="${truncateForLog(actionRecord?.innerText || '', 80)}"`;
+    case 'fill':
+      return `fill selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" label="${truncateForLog(actionRecord?.ariaLabel || '', 80)}" value="${truncateForLog(actionRecord?.value || '', 120)}"`;
+    case 'selectOptions':
+      return `selectOptions selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" value="${truncateForLog(actionRecord?.value || '', 100)}"`;
+    case 'keyboard':
+      return `keyboard key="${truncateForLog(actionRecord?.key || '', 40)}" selector="${truncateForLog(actionRecord?.selector || 'null', 120)}"`;
+    case 'network':
+      return `network method="${truncateForLog(actionRecord?.method || '', 10)}" url="${truncateForLog(actionRecord?.url || '', 160)}" status="${truncateForLog(actionRecord?.status || '', 10)}"`;
+    default:
+      return `unknown payload="${truncateForLog(JSON.stringify(actionRecord), 180)}"`;
+  }
+}
+
+function maybeSendCaptureDiagStatus(message, level = 'info', force = false) {
+  const now = Date.now();
+  const sinceLast = now - (appState.captureDiagnostics.lastStatusAt || 0);
+  if (!force && sinceLast < 1200) {
+    return;
+  }
+  appState.captureDiagnostics.lastStatusAt = now;
+  sendCaptureDiagStatus(message, level).catch(() => {});
+}
 
 function withTimeout(promise, timeoutMs, label) {
   return Promise.race([
@@ -124,6 +198,7 @@ export async function injectMainWorldScripts(tabId) {
 
 async function startDemoMode(tabId) {
   try {
+    resetCaptureDiagnostics();
     appState.mode = MODE_DEMO;
     appState.activeTabId = tabId;
     appState.pendingBatch = [];
@@ -131,6 +206,7 @@ async function startDemoMode(tabId) {
     appState.demoSegments = [];
     await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
+    maybeSendCaptureDiagStatus(`capture pipeline armed for tab=${tabId}; waiting for ACTION_BATCH...`, 'info', true);
   } catch (err) {
     console.error('[sw] startDemoMode failed', err);
     appState.mode = MODE_IDLE;
@@ -190,6 +266,11 @@ async function stopDemoMode() {
     appState.pendingBatch = [];
     appState.demoStartedAt = 0;
     appState.demoSegments = [];
+    maybeSendCaptureDiagStatus(
+      `summary batches=${appState.captureDiagnostics.batchesReceived} actions=${appState.captureDiagnostics.actionsReceived} ignored=${appState.captureDiagnostics.ignoredBatches} byAction=${formatActionBreakdown(appState.captureDiagnostics.byAction)}`,
+      'info',
+      true
+    );
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode stopped.' });
   } catch (err) {
     console.error('[sw] stopDemoMode failed', err);
@@ -197,12 +278,26 @@ async function stopDemoMode() {
   }
 }
 
-function handleActionBatch(message) {
+function handleActionBatch(message, sender) {
   try {
     if (appState.mode !== MODE_DEMO) {
+      appState.captureDiagnostics.ignoredBatches += 1;
+      if (appState.captureDiagnostics.ignoredBatches <= 3 || appState.captureDiagnostics.ignoredBatches % 10 === 0) {
+        maybeSendCaptureDiagStatus(
+          `ignored ACTION_BATCH while mode=${appState.mode}; tab=${sender?.tab?.id ?? 'n/a'} frame=${sender?.frameId ?? 'n/a'}`,
+          'info',
+          true
+        );
+      }
       return;
     }
     if (!Array.isArray(message.actions)) {
+      appState.captureDiagnostics.ignoredBatches += 1;
+      maybeSendCaptureDiagStatus(
+        `received ACTION_BATCH without actions[] payload; keys=${Object.keys(message || {}).join(', ') || 'none'}`,
+        'error',
+        true
+      );
       return;
     }
     const demoStartedAt = appState.demoStartedAt || Date.now();
@@ -226,22 +321,35 @@ function handleActionBatch(message) {
     });
     appState.pendingBatch.push(...normalizedEvents);
 
-    const mutationEvents = normalizedEvents.filter((event) => event && event.type === 'DOM_MUTATION');
-    if (mutationEvents.length) {
-      const sample = mutationEvents[mutationEvents.length - 1];
-      const sampleSummary = Array.isArray(sample.summary)
-        ? sample.summary.map((s) => `${s.kind} on ${s.target}`).join(', ')
-        : '';
-      safeSendRuntimeMessage({
-        type: 'STATUS_UPDATE',
-        level: 'info',
-        message:
-          `[DOM ${(sample.timestamp / 1000).toFixed(2)}s] ${mutationEvents.length} mutation event(s)` +
-          (sampleSummary ? ` | ${sampleSummary}` : '')
-      }).catch(() => {});
+    const byActionInBatch = {};
+    for (const actionRecord of normalizedEvents) {
+      const actionType = actionRecord?.action || 'unknown';
+      byActionInBatch[actionType] = (byActionInBatch[actionType] || 0) + 1;
+      appState.captureDiagnostics.byAction[actionType] = (appState.captureDiagnostics.byAction[actionType] || 0) + 1;
+    }
+
+    appState.captureDiagnostics.batchesReceived += 1;
+    appState.captureDiagnostics.actionsReceived += normalizedEvents.length;
+
+    const shouldReport =
+      appState.captureDiagnostics.batchesReceived <= 3 || appState.captureDiagnostics.batchesReceived % 5 === 0;
+    if (shouldReport) {
+      maybeSendCaptureDiagStatus(
+        `batch#${appState.captureDiagnostics.batchesReceived} actions=${normalizedEvents.length} totalActions=${appState.captureDiagnostics.actionsReceived} inBatch=${formatActionBreakdown(byActionInBatch)} totalByAction=${formatActionBreakdown(appState.captureDiagnostics.byAction)} tab=${sender?.tab?.id ?? 'n/a'} frame=${sender?.frameId ?? 'n/a'} pending=${appState.pendingBatch.length}`,
+        'info'
+      );
+    }
+
+    const senderTab = sender?.tab?.id ?? 'n/a';
+    const senderFrame = sender?.frameId ?? 'n/a';
+    for (const actionRecord of normalizedEvents) {
+      const at = formatRelativeTime(actionRecord?.timestamp);
+      const detail = formatActionDetail(actionRecord);
+      sendCaptureDiagStatus(`action@${at} ${detail} tab=${senderTab} frame=${senderFrame}`).catch(() => {});
     }
   } catch (err) {
     console.error('[sw] handleActionBatch failed', err);
+    maybeSendCaptureDiagStatus(`handleActionBatch error: ${err && err.message ? err.message : String(err)}`, 'error', true);
   }
 }
 
@@ -471,6 +579,23 @@ chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
   }
 });
 
+chrome.tabs.onActivated.addListener(function (activeInfo) {
+  if (appState.mode !== MODE_DEMO) {
+    return;
+  }
+  if (typeof appState.activeTabId !== 'number') {
+    return;
+  }
+  if (activeInfo.tabId === appState.activeTabId) {
+    return;
+  }
+  maybeSendCaptureDiagStatus(
+    `active tab switched to ${activeInfo.tabId}; demo capture remains bound to tab=${appState.activeTabId}`,
+    'info',
+    true
+  );
+});
+
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
   (async function () {
     try {
@@ -512,6 +637,15 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
 
         case 'ACTION_BATCH':
           handleActionBatch(message, sender);
+          sendResponse({ ok: true });
+          break;
+
+        case 'BRIDGE_ERROR':
+          maybeSendCaptureDiagStatus(
+            `bridge error source=${message?.sourceType || 'unknown'} tab=${sender?.tab?.id ?? 'n/a'} frame=${sender?.frameId ?? 'n/a'} error=${message?.error || 'unknown'}`,
+            'error',
+            true
+          );
           sendResponse({ ok: true });
           break;
 
