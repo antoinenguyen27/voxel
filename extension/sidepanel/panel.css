@@ -71,11 +71,52 @@ button:disabled {
 }
 
 .transcript,
-.logs {
+.logs,
+.debug,
+.skills {
   border: 1px solid #dbe3ec;
   border-radius: 8px;
   background: #ffffff;
   padding: 8px;
+}
+
+.skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.skill-card {
+  border: 1px solid #dbe3ec;
+  border-radius: 6px;
+  padding: 8px;
+  background: #f8fbff;
+}
+
+.skill-card h3 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.skill-meta {
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: #516173;
+}
+
+.skill-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.skill-delete-btn {
+  border-color: #e2b9bc;
+  background: #fff7f7;
+  color: #8f1f26;
+  padding: 4px 8px;
+  font-size: 11px;
 }
 
 pre {

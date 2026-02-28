@@ -16,7 +16,8 @@
     workChunks: [],
     workTranscript: '',
     isListening: false,
-    heartbeatTimer: null
+    heartbeatTimer: null,
+    lastSkillResultAt: 0
   };
 
   var ELEVENLABS_VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
@@ -31,7 +32,11 @@
     statusDot: document.getElementById('statusDot'),
     statusText: document.getElementById('statusText'),
     transcriptText: document.getElementById('transcriptText'),
-    logText: document.getElementById('logText')
+    logText: document.getElementById('logText'),
+    demoDebugSection: document.getElementById('demoDebugSection'),
+    demoDebugText: document.getElementById('demoDebugText'),
+    skillsSection: document.getElementById('skillsSection'),
+    skillsList: document.getElementById('skillsList')
   };
 
   function appendLog(line) {
@@ -43,6 +48,125 @@
   function setStatus(text, level) {
     els.statusText.textContent = text;
     els.statusDot.className = 'dot ' + (level || 'idle');
+  }
+
+  function formatTimestamp(ts) {
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+      return 'unknown';
+    }
+    return new Date(ts).toLocaleString();
+  }
+
+  function setDemoDebug(debug) {
+    if (!els.demoDebugSection || !els.demoDebugText) {
+      return;
+    }
+    if (!debug) {
+      els.demoDebugSection.hidden = true;
+      els.demoDebugText.textContent = '';
+      return;
+    }
+    var lines = [];
+    if (typeof debug.segmentCount === 'number' || typeof debug.actionCount === 'number') {
+      lines.push(
+        'Segments: ' + String(debug.segmentCount || 0) + ' | Actions: ' + String(debug.actionCount || 0)
+      );
+      lines.push('');
+    }
+    if (debug.transcriptTimelinePreview) {
+      lines.push('Transcript Timeline Preview:');
+      lines.push(String(debug.transcriptTimelinePreview));
+      lines.push('');
+    }
+    if (debug.actionsPreview) {
+      lines.push('Actions Preview:');
+      lines.push(String(debug.actionsPreview));
+      lines.push('');
+    }
+    if (debug.transcriptPreview) {
+      lines.push('Plain Transcript Preview:');
+      lines.push(String(debug.transcriptPreview));
+    }
+    els.demoDebugText.textContent = lines.join('\n');
+    els.demoDebugSection.hidden = false;
+  }
+
+  function renderSkills(skills) {
+    if (!els.skillsSection || !els.skillsList) {
+      return;
+    }
+    els.skillsList.textContent = '';
+    var list = Array.isArray(skills) ? skills.slice() : [];
+    if (!list.length) {
+      els.skillsSection.hidden = true;
+      return;
+    }
+    list.sort(function (a, b) {
+      return (b && b.createdAt ? b.createdAt : 0) - (a && a.createdAt ? a.createdAt : 0);
+    });
+    var wrap = document.createElement('div');
+    wrap.className = 'skills-list';
+    list.forEach(function (skill) {
+      var card = document.createElement('article');
+      card.className = 'skill-card';
+
+      var title = document.createElement('h3');
+      title.textContent = skill && skill.name ? String(skill.name) : 'Untitled skill';
+      card.appendChild(title);
+
+      var meta = document.createElement('p');
+      meta.className = 'skill-meta';
+      meta.textContent = 'Created: ' + formatTimestamp(skill && skill.createdAt);
+      card.appendChild(meta);
+
+      var actionsRow = document.createElement('div');
+      actionsRow.className = 'skill-actions';
+      var deleteBtn = document.createElement('button');
+      deleteBtn.className = 'skill-delete-btn';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.disabled = !(skill && skill.storageKey);
+      deleteBtn.addEventListener('click', function () {
+        if (!skill || !skill.storageKey) {
+          appendLog('Cannot delete skill: missing storage key.');
+          return;
+        }
+        deleteBtn.disabled = true;
+        sendRuntimeMessage({ type: 'DELETE_SKILL', storageKey: skill.storageKey }, 15000)
+          .then(function (response) {
+            if (!response || !response.ok) {
+              throw new Error((response && response.error) || 'Delete failed.');
+            }
+            appendLog('Deleted skill: ' + (skill.name || skill.storageKey));
+            return refreshSkills();
+          })
+          .catch(function (err) {
+            appendLog('Failed to delete skill: ' + err.message);
+            deleteBtn.disabled = false;
+          });
+      });
+      actionsRow.appendChild(deleteBtn);
+      card.appendChild(actionsRow);
+
+      var content = document.createElement('pre');
+      content.textContent = skill && skill.content ? String(skill.content) : '';
+      card.appendChild(content);
+
+      wrap.appendChild(card);
+    });
+    els.skillsList.appendChild(wrap);
+    els.skillsSection.hidden = false;
+  }
+
+  async function refreshSkills() {
+    try {
+      var response = await sendRuntimeMessage({ type: 'GET_SKILLS' }, 15000);
+      if (!response || !response.ok) {
+        return;
+      }
+      renderSkills(Array.isArray(response.skills) ? response.skills : []);
+    } catch (err) {
+      appendLog('Failed to load skills: ' + err.message);
+    }
   }
 
   async function getStoredApiKey(service) {
@@ -585,7 +709,9 @@
       state.demoTranscript = '';
       state.demoTranscriptChunks = [];
       state.demoStartedAt = Date.now();
+      state.lastSkillResultAt = 0;
       els.transcriptText.textContent = '';
+      setDemoDebug(null);
       updateButtons();
       setStatus('Demo recording...', 'busy');
       startHeartbeat();
@@ -617,10 +743,14 @@
   async function stopDemoMode() {
     try {
       stopDemoTranscription();
+      setStatus('Generating skill from demo...', 'busy');
+      appendLog('Stopping demo and handing off to skill writer...');
       await sendRuntimeMessage({ type: 'STOP_DEMO' });
       state.mode = 'idle';
       updateButtons();
-      setStatus('Idle', 'idle');
+      if (Date.now() - (state.lastSkillResultAt || 0) > 2500) {
+        setStatus('Idle', 'idle');
+      }
       stopHeartbeat();
       appendLog('Demo mode stopped.');
     } catch (err) {
@@ -737,9 +867,24 @@
         return;
       }
       if (message.type === 'STATUS_UPDATE') {
+        var text = String(message.message || 'Update');
         var level = message.level === 'error' ? 'error' : message.level === 'success' ? 'ready' : 'busy';
+        if (message.level === 'info' && /demo mode stopped/i.test(text)) {
+          level = 'idle';
+        }
+        if (message.level === 'info' && /generating skill/i.test(text)) {
+          level = 'busy';
+        }
         setStatus(message.message || 'Update', level);
         appendLog(message.message || 'Update');
+        return;
+      }
+      if (message.type === 'DEMO_SKILL_RESULT') {
+        state.lastSkillResultAt = Date.now();
+        setStatus('Skill ready', 'ready');
+        appendLog('Skill generated: ' + (message.skillName || 'Unnamed skill'));
+        setDemoDebug(message.debug || null);
+        refreshSkills().catch(function (_err) {});
         return;
       }
     } catch (err) {
@@ -779,4 +924,5 @@
 
   updateButtons();
   setStatus('Idle', 'idle');
+  refreshSkills().catch(function (_err) {});
 })();

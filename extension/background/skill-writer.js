@@ -4,6 +4,8 @@ export const SKILL_WRITER_SYSTEM_PROMPT = `You write SKILL.md files for a browse
 
 You will be given a voice narration describing what the user intended, and a list of classified actions that were observed during that narration. The actions are already in executable form — your job is to select the meaningful ones (ignoring accidental or redundant actions), and write a skill that reproduces the user's intent.
 
+You may also receive timestamped transcript lines and timestamped action lines. Use temporal ordering to align intent with actions; prefer actions that occur near the narrated intent.
+
 The execution environment provides exactly these helpers, all async:
 - click(selector)
 - fill(selector, value)
@@ -75,14 +77,30 @@ function extractResponseText(data) {
   }
 }
 
-export async function writeSkillFromSegment(transcript, actions) {
+function formatRelativeTime(ts) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+    return '0.00s';
+  }
+  return `${(Math.max(0, ts) / 1000).toFixed(2)}s`;
+}
+
+export async function writeSkillFromSegment(transcript, actions, options = {}) {
   try {
     const apiKey = await getStoredApiKey('mistral');
     if (!apiKey) {
       throw new Error('Missing Mistral API key. Set it in extension options.');
     }
 
+    const transcriptTimeline = String(options?.transcriptTimeline || '').trim();
     const actionSummary = formatActionsForPrompt(actions || []);
+    const voiceSection = transcriptTimeline
+      ? `Voice narration (timestamped):\n${transcriptTimeline}\n\nVoice narration (plain): "${String(transcript || '')}"`
+      : `Voice narration: "${String(transcript || '')}"`;
+    const promptInput = {
+      voiceSection,
+      observedActions: actionSummary
+    };
+
     const response = await fetch(MISTRAL_CHAT_URL, {
       method: 'POST',
       headers: {
@@ -96,7 +114,7 @@ export async function writeSkillFromSegment(transcript, actions) {
           { role: 'system', content: SKILL_WRITER_SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `Voice narration: "${String(transcript || '')}"\n\nObserved actions:\n${actionSummary}`
+            content: `${voiceSection}\n\nObserved actions (timestamped):\n${actionSummary}`
           }
         ]
       })
@@ -116,7 +134,11 @@ export async function writeSkillFromSegment(transcript, actions) {
     const nameMatch = skillText.match(/^#\s+(.+)$/m);
     const skillName = (nameMatch && nameMatch[1] ? nameMatch[1].trim() : '') || `skill-${Date.now()}`;
     await saveSkill(skillName, skillText);
-    return skillName;
+    return {
+      skillName,
+      skillText,
+      promptInput
+    };
   } catch (err) {
     console.error('[skill-writer] writeSkillFromSegment failed', err);
     throw err;
@@ -127,19 +149,20 @@ export function formatActionsForPrompt(actions) {
   try {
     return (actions || [])
       .map((a) => {
+        const ts = `[${formatRelativeTime(a?.timestamp)}] `;
         switch (a?.action) {
           case 'click':
-            return `[click] ${a.tag || 'element'} | selector: ${a.selector} | label: "${a.ariaLabel || ''}" | text: "${a.innerText || ''}"`;
+            return `${ts}[click] ${a.tag || 'element'} | selector: ${a.selector} | label: "${a.ariaLabel || ''}" | text: "${a.innerText || ''}"`;
           case 'fill':
-            return `[fill] selector: ${a.selector} | label: "${a.ariaLabel || ''}" | value: "${a.value}"`;
+            return `${ts}[fill] selector: ${a.selector} | label: "${a.ariaLabel || ''}" | value: "${a.value}"`;
           case 'selectOptions':
-            return `[selectOptions] selector: ${a.selector} | value: "${a.value}"`;
+            return `${ts}[selectOptions] selector: ${a.selector} | value: "${a.value}"`;
           case 'keyboard':
-            return `[keyboard] key: ${a.key}`;
+            return `${ts}[keyboard] type: ${a.eventType || 'keydown'} | key: ${a.key} | code: ${a.code || ''} | ctrl:${!!a.ctrlKey} meta:${!!a.metaKey} alt:${!!a.altKey} shift:${!!a.shiftKey}`;
           case 'network':
-            return `[network] ${a.method} ${a.url} → ${a.status}`;
+            return `${ts}[network] ${a.method} ${a.url} → ${a.status}`;
           default:
-            return JSON.stringify(a);
+            return `${ts}${JSON.stringify(a)}`;
         }
       })
       .join('\n');
@@ -172,9 +195,27 @@ export async function saveSkill(name, content) {
 export async function loadAllSkills() {
   try {
     const all = await chrome.storage.local.get(null);
-    return Object.values(all).filter((v) => v && v.name && v.content);
+    return Object.entries(all)
+      .filter(([key, value]) => key.startsWith('skill_') && value && value.name && value.content)
+      .map(([key, value]) => ({
+        storageKey: key,
+        ...value
+      }));
   } catch (err) {
     console.error('[skill-writer] loadAllSkills failed', err);
     return [];
+  }
+}
+
+export async function deleteSkill(storageKey) {
+  try {
+    if (!storageKey || typeof storageKey !== 'string' || !storageKey.startsWith('skill_')) {
+      throw new Error('Invalid skill key.');
+    }
+    await chrome.storage.local.remove(storageKey);
+    return true;
+  } catch (err) {
+    console.error('[skill-writer] deleteSkill failed', err);
+    throw err;
   }
 }

@@ -1,4 +1,4 @@
-import { writeSkillFromSegment, loadAllSkills } from './skill-writer.js';
+import { writeSkillFromSegment, loadAllSkills, deleteSkill } from './skill-writer.js';
 import { buildWorkAgent } from './work-agent.js';
 
 const MODE_IDLE = 'idle';
@@ -53,6 +53,22 @@ function truncateForLog(value, max = 80) {
 function formatRelativeTime(ms) {
   const value = typeof ms === 'number' && Number.isFinite(ms) ? Math.max(0, ms) : 0;
   return `${(value / 1000).toFixed(2)}s`;
+}
+
+function previewMultiline(text, maxLines = 14, maxChars = 1800) {
+  const safeText = String(text || '');
+  if (!safeText.trim()) {
+    return '';
+  }
+  const lines = safeText.split('\n').slice(0, maxLines);
+  let preview = lines.join('\n');
+  if (safeText.length > maxChars) {
+    preview = preview.slice(0, maxChars - 1) + '…';
+  }
+  if (safeText.split('\n').length > maxLines) {
+    preview += '\n…';
+  }
+  return preview;
 }
 
 async function sendCaptureDiagStatus(message, level = 'info') {
@@ -286,14 +302,52 @@ async function stopDemoMode() {
         .map((segment) => String(segment.transcript || '').trim())
         .filter(Boolean)
         .join('\n');
+      const transcriptTimeline = demoSegments
+        .map((segment) => {
+          const text = String(segment.transcript || '').trim();
+          if (!text) {
+            return null;
+          }
+          const ts =
+            typeof segment.segmentEnd === 'number' && Number.isFinite(segment.segmentEnd)
+              ? segment.segmentEnd
+              : typeof segment.segmentStart === 'number' && Number.isFinite(segment.segmentStart)
+                ? segment.segmentStart
+                : 0;
+          return `[${formatRelativeTime(ts)}] ${text}`;
+        })
+        .filter(Boolean)
+        .join('\n');
       const finalEvents = demoSegments.flatMap((segment) => (Array.isArray(segment.events) ? segment.events : []));
 
       if (finalTranscript && finalEvents.length) {
-        const skillName = await writeSkillFromSegment(finalTranscript, finalEvents);
+        await safeSendRuntimeMessage({
+          type: 'STATUS_UPDATE',
+          level: 'info',
+          message: 'Generating skill from recorded demo...'
+        });
+        const skillResult = await writeSkillFromSegment(finalTranscript, finalEvents, {
+          transcriptTimeline
+        });
+        const skillName = typeof skillResult === 'string' ? skillResult : skillResult?.skillName || `skill-${Date.now()}`;
+        const skillContent = typeof skillResult === 'string' ? '' : skillResult?.skillText || '';
+        const promptInput = typeof skillResult === 'string' ? null : skillResult?.promptInput || null;
         await safeSendRuntimeMessage({
           type: 'STATUS_UPDATE',
           level: 'success',
           message: `Saved skill: ${skillName}`
+        });
+        await safeSendRuntimeMessage({
+          type: 'DEMO_SKILL_RESULT',
+          skillName,
+          skillContent,
+          debug: {
+            transcriptTimelinePreview: previewMultiline(transcriptTimeline, 14, 1800),
+            actionsPreview: previewMultiline(promptInput?.observedActions || '', 18, 2600),
+            transcriptPreview: previewMultiline(finalTranscript, 8, 1000),
+            actionCount: finalEvents.length,
+            segmentCount: demoSegments.length
+          }
         });
       } else {
         await safeSendRuntimeMessage({
@@ -658,6 +712,21 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
             }
           });
           break;
+
+        case 'GET_SKILLS': {
+          const skills = await loadAllSkills();
+          sendResponse({
+            ok: true,
+            skills: Array.isArray(skills) ? skills : []
+          });
+          break;
+        }
+
+        case 'DELETE_SKILL': {
+          await deleteSkill(message.storageKey);
+          sendResponse({ ok: true });
+          break;
+        }
 
         case 'START_DEMO':
           await startDemoMode(message.tabId);
