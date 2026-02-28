@@ -14,6 +14,52 @@ const appState = {
 
 const pendingExecutions = new Map();
 
+function withTimeout(promise, timeoutMs, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    })
+  ]);
+}
+
+async function executeScriptBestEffort(tabId, file, world) {
+  const allFramesLabel = `${file} allFrames injection`;
+  const topFrameLabel = `${file} topFrame injection`;
+
+  try {
+    await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        files: [file],
+        world
+      }),
+      3500,
+      allFramesLabel
+    );
+    return { scope: 'allFrames' };
+  } catch (allFramesErr) {
+    console.warn('[sw] allFrames injection failed, falling back to top frame', {
+      tabId,
+      file,
+      error: allFramesErr?.message || String(allFramesErr)
+    });
+  }
+
+  await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId },
+      files: [file],
+      world
+    }),
+    3500,
+    topFrameLabel
+  );
+  return { scope: 'topFrame' };
+}
+
 async function enableActionClickToOpenSidePanel() {
   try {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -62,24 +108,12 @@ export async function injectMainWorldScripts(tabId) {
   try {
     await getInjectableTab(tabId);
     const prefix = getScriptPrefix();
+    const files = [`${prefix}lib/selector.js`, `${prefix}content/capture.js`, `${prefix}content/executor.js`];
 
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      files: [`${prefix}lib/selector.js`],
-      world: 'MAIN'
-    });
-
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      files: [`${prefix}content/capture.js`],
-      world: 'MAIN'
-    });
-
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      files: [`${prefix}content/executor.js`],
-      world: 'MAIN'
-    });
+    for (const file of files) {
+      const result = await executeScriptBestEffort(tabId, file, 'MAIN');
+      console.log('[sw] injected main-world script', { tabId, file, scope: result.scope });
+    }
   } catch (err) {
     console.error('[sw] injectMainWorldScripts failed', { tabId, err });
     throw err;
@@ -91,7 +125,7 @@ async function startDemoMode(tabId) {
     appState.mode = MODE_DEMO;
     appState.activeTabId = tabId;
     appState.pendingBatch = [];
-    await injectMainWorldScripts(tabId);
+    await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
   } catch (err) {
     console.error('[sw] startDemoMode failed', err);
@@ -168,7 +202,7 @@ async function startWorkMode(tabId) {
     appState.mode = MODE_WORK;
     appState.activeTabId = tabId;
     appState.sessionMemory = [];
-    await injectMainWorldScripts(tabId);
+    await withTimeout(injectMainWorldScripts(tabId), 25000, 'Work injection');
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Work mode started.' });
   } catch (err) {
     console.error('[sw] startWorkMode failed', err);

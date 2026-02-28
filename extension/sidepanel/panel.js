@@ -14,6 +14,7 @@
   };
 
   var ELEVENLABS_VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+  var VOXTRAL_BATCH_MODELS = ['voxtral-mini-latest', 'voxtral-mini-transcribe-v2'];
 
   var els = {
     startDemoBtn: document.getElementById('startDemoBtn'),
@@ -49,10 +50,25 @@
     }
   }
 
-  async function sendRuntimeMessage(message) {
+  async function sendRuntimeMessage(message, timeoutMs) {
     try {
       return await new Promise(function (resolve, reject) {
+        var settled = false;
+        var timeout = typeof timeoutMs === 'number' ? timeoutMs : 12000;
+        var timer = setTimeout(function () {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          reject(new Error('Service worker response timed out.'));
+        }, timeout);
+
         chrome.runtime.sendMessage(message, function (response) {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
           var runtimeError = chrome.runtime.lastError;
           if (runtimeError) {
             reject(new Error(runtimeError.message));
@@ -61,18 +77,6 @@
           resolve(response || {});
         });
       });
-    } catch (err) {
-      throw err;
-    }
-  }
-
-  async function getActiveTabId() {
-    try {
-      var tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tabs.length || typeof tabs[0].id !== 'number') {
-        throw new Error('No active tab found.');
-      }
-      return tabs[0].id;
     } catch (err) {
       throw err;
     }
@@ -129,19 +133,39 @@
     return name + ': ' + message;
   }
 
-  async function ensureMicPermission() {
-    var stream = null;
+  async function getMicrophonePermissionState() {
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } finally {
-      if (stream) {
-        stream.getTracks().forEach(function (track) {
-          try {
-            track.stop();
-          } catch (_err) {}
-        });
+      if (!navigator.permissions || typeof navigator.permissions.query !== 'function') {
+        return 'unknown';
       }
+      var status = await navigator.permissions.query({ name: 'microphone' });
+      return status && status.state ? String(status.state) : 'unknown';
+    } catch (_err) {
+      return 'unknown';
     }
+  }
+
+  function normalizeMicError(err, permissionState) {
+    var raw = describeError(err).toLowerCase();
+    if (permissionState === 'denied') {
+      return 'Microphone is blocked for this extension. Re-enable microphone access and retry.';
+    }
+    if (raw.indexOf('permission dismissed') !== -1) {
+      return 'Microphone prompt was dismissed. Click Start Demo again and choose Allow.';
+    }
+    return normalizeUserFacingError(err);
+  }
+
+  async function getUserMediaWithTimeout(constraints, timeoutMs) {
+    var timeout = typeof timeoutMs === 'number' ? timeoutMs : 12000;
+    return await Promise.race([
+      navigator.mediaDevices.getUserMedia(constraints),
+      new Promise(function (_resolve, reject) {
+        setTimeout(function () {
+          reject(new Error('Microphone request timed out.'));
+        }, timeout);
+      })
+    ]);
   }
 
   function updateButtons() {
@@ -181,25 +205,44 @@
         throw new Error('Missing Mistral API key. Set it in options.');
       }
 
-      var formData = new FormData();
-      formData.append('file', audioBlob, 'audio.webm');
-      formData.append('model', 'voxtral-mini-transcribe-v2');
+      var lastError = '';
+      for (var i = 0; i < VOXTRAL_BATCH_MODELS.length; i += 1) {
+        var model = VOXTRAL_BATCH_MODELS[i];
+        var formData = new FormData();
+        formData.append('file', audioBlob, 'audio.webm');
+        formData.append('model', model);
+        appendLog('Transcription attempt with model: ' + model);
 
-      var response = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + apiKey },
-        body: formData
-      });
+        var response = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + apiKey },
+          body: formData
+        });
 
-      if (!response.ok) {
+        if (response.ok) {
+          var data = await response.json();
+          return (data && data.text ? String(data.text) : '').trim();
+        }
+
         var errorText = await response.text().catch(function () {
           return '';
         });
-        throw new Error('Voxtral transcription failed (' + response.status + '): ' + errorText.slice(0, 300));
+        lastError = 'Voxtral transcription failed (' + response.status + '): ' + errorText.slice(0, 300);
+
+        var normalized = (errorText || '').toLowerCase();
+        var modelInvalid =
+          response.status === 400 &&
+          (normalized.indexOf('invalid model') !== -1 || normalized.indexOf('\"code\":\"1500\"') !== -1);
+
+        if (modelInvalid && i < VOXTRAL_BATCH_MODELS.length - 1) {
+          appendLog('Model rejected by API, trying fallback model...');
+          continue;
+        }
+
+        throw new Error(lastError);
       }
 
-      var data = await response.json();
-      return (data && data.text ? String(data.text) : '').trim();
+      throw new Error(lastError || 'Voxtral transcription failed for all configured models.');
     } catch (err) {
       throw err;
     }
@@ -207,14 +250,12 @@
 
   async function startDemoTranscription() {
     try {
-      state.demoStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: 16000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true
-        }
-      });
+      appendLog(
+        'Requesting microphone. userActivation.isActive=' +
+          (!!(navigator.userActivation && navigator.userActivation.isActive))
+      );
+      state.demoStream = await getUserMediaWithTimeout({ audio: true }, 12000);
+      appendLog('Microphone stream acquired.');
 
       state.demoChunks = [];
       state.demoRecorder = new MediaRecorder(state.demoStream, { mimeType: 'audio/webm' });
@@ -326,7 +367,7 @@
       setStatus('Listening...', 'busy');
 
       state.workChunks = [];
-      state.workStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      state.workStream = await getUserMediaWithTimeout({ audio: true }, 12000);
       state.workRecorder = new MediaRecorder(state.workStream, { mimeType: 'audio/webm' });
 
       state.workRecorder.ondataavailable = function (event) {
@@ -448,15 +489,18 @@
   async function startDemoMode() {
     var runtimeStarted = false;
     try {
+      setStatus('Starting demo...', 'busy');
+      appendLog('Checking active tab...');
+
       var activeTab = await getActiveTab();
       if (!isInjectableUrl(activeTab.url || '')) {
         throw new Error('Cannot inject into this tab');
       }
 
-      await ensureMicPermission();
-
+      appendLog('Sending START_DEMO...');
       state.activeTabId = activeTab.id;
-      var response = await sendRuntimeMessage({ type: 'START_DEMO', tabId: state.activeTabId });
+      var response = await sendRuntimeMessage({ type: 'START_DEMO', tabId: state.activeTabId }, 35000);
+      appendLog('START_DEMO response received.');
       if (!response.ok) {
         throw new Error(response.error || 'Failed to start demo mode.');
       }
@@ -466,7 +510,10 @@
       updateButtons();
       setStatus('Demo recording...', 'busy');
       startHeartbeat();
+      appendLog('Starting microphone capture...');
       await startDemoTranscription();
+      var micStateBefore = await getMicrophonePermissionState();
+      appendLog('Microphone permission state before request: ' + micStateBefore);
       appendLog('Demo mode active.');
     } catch (err) {
       if (runtimeStarted) {
@@ -479,9 +526,11 @@
       state.activeTabId = null;
       updateButtons();
       stopHeartbeat();
-      var message = normalizeUserFacingError(err);
+      var permissionState = await getMicrophonePermissionState();
+      var message = normalizeMicError(err, permissionState);
       setStatus(message, 'error');
       appendLog('startDemoMode failed: ' + message);
+      appendLog('Microphone permission state after failure: ' + permissionState);
       appendLog('startDemoMode raw error: ' + describeError(err));
     }
   }
@@ -509,7 +558,8 @@
       }
 
       state.activeTabId = activeTab.id;
-      var response = await sendRuntimeMessage({ type: 'START_WORK', tabId: state.activeTabId });
+      var response = await sendRuntimeMessage({ type: 'START_WORK', tabId: state.activeTabId }, 35000);
+      appendLog('START_WORK response received.');
       if (!response.ok) {
         throw new Error(response.error || 'Failed to start work mode.');
       }
@@ -590,19 +640,26 @@
     } catch (err) {
       state.isListening = false;
       updateButtons();
-      setStatus(err.message, 'error');
-      appendLog('runWorkInstruction failed: ' + err.message);
+      var permissionState = await getMicrophonePermissionState();
+      var message = normalizeMicError(err, permissionState);
+      setStatus(message, 'error');
+      appendLog('runWorkInstruction failed: ' + message);
+      appendLog('Microphone permission state after work failure: ' + permissionState);
+      appendLog('runWorkInstruction raw error: ' + describeError(err));
     }
   }
 
   chrome.runtime.onMessage.addListener(function (message) {
     try {
-      if (!message || message.type !== 'STATUS_UPDATE') {
+      if (!message) {
         return;
       }
-      var level = message.level === 'error' ? 'error' : message.level === 'success' ? 'ready' : 'busy';
-      setStatus(message.message || 'Update', level);
-      appendLog(message.message || 'Update');
+      if (message.type === 'STATUS_UPDATE') {
+        var level = message.level === 'error' ? 'error' : message.level === 'success' ? 'ready' : 'busy';
+        setStatus(message.message || 'Update', level);
+        appendLog(message.message || 'Update');
+        return;
+      }
     } catch (err) {
       appendLog('Status listener failed: ' + err.message);
     }
