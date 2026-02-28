@@ -22,6 +22,55 @@
     }
   }
 
+  function setElementValue(el, value) {
+    if (!el) {
+      return;
+    }
+
+    if (el.getAttribute && el.getAttribute('contenteditable') === 'true') {
+      el.textContent = value;
+      return;
+    }
+
+    var proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value');
+
+    if (nativeSetter && typeof nativeSetter.set === 'function') {
+      nativeSetter.set.call(el, value);
+    } else {
+      el.value = value;
+    }
+  }
+
+  function appendElementValue(el, char) {
+    if (!el) {
+      return;
+    }
+
+    if (el.getAttribute && el.getAttribute('contenteditable') === 'true') {
+      el.textContent = (el.textContent || '') + char;
+      return;
+    }
+
+    var proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value');
+    var current = el.value || '';
+
+    if (nativeSetter && typeof nativeSetter.set === 'function') {
+      nativeSetter.set.call(el, current + char);
+    } else {
+      el.value = current + char;
+    }
+  }
+
+  function dispatchInput(el, init) {
+    try {
+      el.dispatchEvent(new InputEvent('input', init));
+    } catch (_err) {
+      el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true, composed: true }));
+    }
+  }
+
   var executorHelpers = {
     delay: function (ms) {
       return new Promise(function (resolve) {
@@ -69,41 +118,133 @@
     },
 
     click: async function (selectorOrEl) {
-      var el = typeof selectorOrEl === 'string' ? document.querySelector(selectorOrEl) : selectorOrEl;
+      var el = typeof selectorOrEl === 'string' ? await executorHelpers.waitForElement(selectorOrEl) : selectorOrEl;
       if (!el) {
-        throw new Error('Element not found: ' + selectorOrEl);
+        throw new Error('click: element not found - ' + selectorOrEl);
       }
-      el.focus();
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+      if (typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'center' });
+      }
+      if (typeof el.focus === 'function') {
+        el.focus();
+      }
+
+      // user-event is test-focused; dispatching native DOM events is safer for live page injection.
+      var PointerCtor = window.PointerEvent || MouseEvent;
+      var eventSequence = [
+        ['pointerover', PointerCtor],
+        ['mouseover', MouseEvent],
+        ['pointermove', PointerCtor],
+        ['mousemove', MouseEvent],
+        ['pointerdown', PointerCtor],
+        ['mousedown', MouseEvent],
+        ['pointerup', PointerCtor],
+        ['mouseup', MouseEvent],
+        ['click', MouseEvent]
+      ];
+
+      var baseInit = { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1 };
+
+      for (var i = 0; i < eventSequence.length; i += 1) {
+        var type = eventSequence[i][0];
+        var Ctor = eventSequence[i][1];
+        var isPointerEvent = type.indexOf('pointer') === 0;
+        var init = isPointerEvent
+          ? { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true }
+          : baseInit;
+
+        el.dispatchEvent(new Ctor(type, init));
+      }
+
       return el;
     },
 
-    setValue: function (selectorOrEl, value) {
-      var el = typeof selectorOrEl === 'string' ? document.querySelector(selectorOrEl) : selectorOrEl;
+    fill: async function (selectorOrEl, value) {
+      var el = typeof selectorOrEl === 'string' ? await executorHelpers.waitForElement(selectorOrEl) : selectorOrEl;
       if (!el) {
-        throw new Error('Element not found: ' + selectorOrEl);
+        throw new Error('fill: element not found - ' + selectorOrEl);
       }
 
-      el.focus();
-
-      var prototype = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      var nativeSetter = Object.getOwnPropertyDescriptor(prototype, 'value');
-
-      if (nativeSetter && typeof nativeSetter.set === 'function') {
-        nativeSetter.set.call(el, value);
-      } else {
-        el.value = value;
+      if (typeof el.focus === 'function') {
+        el.focus();
       }
 
-      try {
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: String(value) }));
-      } catch (_err) {
-        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-      }
-      el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      setElementValue(el, value);
+
+      dispatchInput(el, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        data: String(value),
+        inputType: 'insertText'
+      });
+
+      el.dispatchEvent(new Event('change', { bubbles: true }));
       return el;
+    },
+
+    type: async function (selectorOrEl, text) {
+      var el = typeof selectorOrEl === 'string' ? await executorHelpers.waitForElement(selectorOrEl) : selectorOrEl;
+      if (!el) {
+        throw new Error('type: element not found - ' + selectorOrEl);
+      }
+
+      if (typeof el.focus === 'function') {
+        el.focus();
+      }
+
+      for (var char of String(text || '')) {
+        el.dispatchEvent(
+          new KeyboardEvent('keydown', { key: char, bubbles: true, cancelable: true, composed: true })
+        );
+        el.dispatchEvent(
+          new KeyboardEvent('keypress', { key: char, bubbles: true, cancelable: true, composed: true })
+        );
+
+        appendElementValue(el, char);
+
+        dispatchInput(el, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          data: char,
+          inputType: 'insertText'
+        });
+
+        el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true, composed: true }));
+      }
+
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return el;
+    },
+
+    keyboard: async function (key) {
+      var init = { key: key, bubbles: true, cancelable: true, composed: true };
+      var activeEl = document.activeElement || document.body;
+      if (!activeEl) {
+        return;
+      }
+      activeEl.dispatchEvent(new KeyboardEvent('keydown', init));
+      activeEl.dispatchEvent(new KeyboardEvent('keyup', init));
+    },
+
+    selectOptions: async function (selectorOrEl, value) {
+      var el = typeof selectorOrEl === 'string' ? await executorHelpers.waitForElement(selectorOrEl) : selectorOrEl;
+      if (!el) {
+        throw new Error('selectOptions: element not found - ' + selectorOrEl);
+      }
+
+      if (typeof el.focus === 'function') {
+        el.focus();
+      }
+      el.value = value;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return el;
+    },
+
+    setValue: async function (selectorOrEl, value) {
+      return executorHelpers.fill(selectorOrEl, value);
     }
   };
 
@@ -121,7 +262,7 @@
     try {
       var fn = new Function(
         '__helpers',
-        'const { click, setValue, waitForElement, getElement, delay } = __helpers; return (async () => {' +
+        'const { click, fill, type, keyboard, selectOptions, setValue, waitForElement, getElement, delay } = __helpers; return (async () => {' +
           String(code || '') +
           '\n})();'
       );

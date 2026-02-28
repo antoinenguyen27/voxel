@@ -2,44 +2,52 @@ const MISTRAL_CHAT_URL = 'https://api.mistral.ai/v1/chat/completions';
 
 export const SKILL_WRITER_SYSTEM_PROMPT = `You write SKILL.md files for a browser automation agent.
 
-Given a voice narration and a list of observed browser events, write a structured skill file.
+You will be given a voice narration describing what the user intended, and a list of classified actions that were observed during that narration. The actions are already in executable form — your job is to select the meaningful ones (ignoring accidental or redundant actions), and write a skill that reproduces the user's intent.
+
+The execution environment provides exactly these helpers, all async:
+- click(selector)
+- fill(selector, value)
+- type(selector, text)        — use for rich text editors only; prefer fill for normal inputs
+- selectOptions(selector, value)
+- keyboard(key)               — for Enter, Escape, Tab, arrow keys
+- waitForElement(selector, timeoutMs)
+- delay(ms)
 
 Output ONLY the skill markdown. Format:
 
 # [Concise skill name, e.g. "Add a new slide in Google Slides"]
 
 ## Description
-[What this skill does, 1-2 sentences]
+[What this skill does, 1 sentence]
 
 ## Preconditions
-- [State the page/app must be in]
+- [Required state of the page before this skill runs]
 
 ## Actions
 \`\`\`javascript
-// Execution code using only these helpers:
-// click(selector), setValue(selector, value), waitForElement(selector), delay(ms)
-// All are async — always await them.
-
+// Use only the helpers listed above. Always await them.
 await click('[aria-label="New slide"]');
-await waitForElement('.punch-viewer-container');
 \`\`\`
 
-## Network Signature (optional)
-If the action triggers a specific network call, document it here for verification.
+## Network Signature (if present)
 Method: POST
 URL pattern: /presentations/*/slides
 
 ## Confidence
-[high|medium|low] — based on selector quality and whether network evidence corroborates DOM events.
+[high | medium | low]
+- high: aria-label or stable data-* selectors, corroborated by network call
+- medium: role/class selectors, no network corroboration
+- low: positional selectors (nth-child), ambiguous actions
 
 ## Notes
-[Any caveats — e.g. canvas-rendered UI, iframe context, React synthetic events]
+[Caveats only — omit if none. E.g. canvas UI, cross-origin iframe, React contenteditable]
 
 Rules:
-- Use aria-label selectors preferentially. They are the most stable.
-- If a selector is marked low confidence (nth-child), note it and suggest the user re-record.
-- If the voice narration is ambiguous, write the most conservative interpretation.
-- Never include credentials, personal data, or full URL paths with document IDs.`;
+- Prefer aria-label selectors. They are the most stable.
+- If multiple clicks happened before the target, include only the one that achieved the intent.
+- If the voice narration and action list disagree, trust the action list and note the discrepancy.
+- Never include credentials, document IDs, or full URLs with user-specific path segments.
+- If confidence is low, add a note recommending the user re-record this skill.`;
 
 async function getStoredApiKey(service = 'mistral') {
   try {
@@ -67,14 +75,14 @@ function extractResponseText(data) {
   }
 }
 
-export async function writeSkillFromSegment(transcript, events) {
+export async function writeSkillFromSegment(transcript, actions) {
   try {
     const apiKey = await getStoredApiKey('mistral');
     if (!apiKey) {
       throw new Error('Missing Mistral API key. Set it in extension options.');
     }
 
-    const eventSummary = formatEventsForPrompt(events || []);
+    const actionSummary = formatActionsForPrompt(actions || []);
     const response = await fetch(MISTRAL_CHAT_URL, {
       method: 'POST',
       headers: {
@@ -88,7 +96,7 @@ export async function writeSkillFromSegment(transcript, events) {
           { role: 'system', content: SKILL_WRITER_SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `Voice narration: "${String(transcript || '')}"\n\nObserved events:\n${eventSummary}`
+            content: `Voice narration: "${String(transcript || '')}"\n\nObserved actions:\n${actionSummary}`
           }
         ]
       })
@@ -115,37 +123,28 @@ export async function writeSkillFromSegment(transcript, events) {
   }
 }
 
-export function formatEventsForPrompt(events) {
+export function formatActionsForPrompt(actions) {
   try {
-    function formatTs(ts) {
-      if (typeof ts !== 'number' || !Number.isFinite(ts)) {
-        return 'unknown-time';
-      }
-      if (ts >= 0 && ts < 24 * 60 * 60 * 1000) {
-        return `${(ts / 1000).toFixed(2)}s`;
-      }
-      return new Date(ts).toISOString();
-    }
-
-    return (events || [])
-      .map((e) => {
-        if (e?.type === 'DOM_EVENT') {
-          return `[${formatTs(e.timestamp)}] [${e.eventType}] ${e.tag} | selector: ${e.selector} | label: ${e.ariaLabel} | value: ${e.value} | confidence: ${e.confidence}`;
+    return (actions || [])
+      .map((a) => {
+        switch (a?.action) {
+          case 'click':
+            return `[click] ${a.tag || 'element'} | selector: ${a.selector} | label: "${a.ariaLabel || ''}" | text: "${a.innerText || ''}"`;
+          case 'fill':
+            return `[fill] selector: ${a.selector} | label: "${a.ariaLabel || ''}" | value: "${a.value}"`;
+          case 'selectOptions':
+            return `[selectOptions] selector: ${a.selector} | value: "${a.value}"`;
+          case 'keyboard':
+            return `[keyboard] key: ${a.key}`;
+          case 'network':
+            return `[network] ${a.method} ${a.url} → ${a.status}`;
+          default:
+            return JSON.stringify(a);
         }
-        if (e?.type === 'DOM_MUTATION') {
-          const summary = Array.isArray(e.summary)
-            ? e.summary.map((s) => `${s.kind} on ${s.target}`).join(', ')
-            : '';
-          return `[${formatTs(e.timestamp)}] [mutation] ${e.count} changes | ${summary}`;
-        }
-        if (e?.type === 'NETWORK_FETCH' || e?.type === 'NETWORK_XHR') {
-          return `[${formatTs(e.timestamp)}] [network] ${e.method} ${e.url} → ${e.status}`;
-        }
-        return JSON.stringify(e);
       })
       .join('\n');
   } catch (err) {
-    console.error('[skill-writer] formatEventsForPrompt failed', err);
+    console.error('[skill-writer] formatActionsForPrompt failed', err);
     return '';
   }
 }

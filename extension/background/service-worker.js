@@ -202,12 +202,12 @@ function handleActionBatch(message) {
     if (appState.mode !== MODE_DEMO) {
       return;
     }
-    if (!Array.isArray(message.events)) {
+    if (!Array.isArray(message.actions)) {
       return;
     }
     const demoStartedAt = appState.demoStartedAt || Date.now();
     const fallbackTimestamp = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
-    const normalizedEvents = message.events.map((event) => {
+    const normalizedEvents = message.actions.map((event) => {
       const sourceTimestamp = typeof event?.timestamp === 'number' ? event.timestamp : fallbackTimestamp;
       const relativeTimestamp = Math.max(0, sourceTimestamp - demoStartedAt);
       if (event && typeof event === 'object' && typeof event.timestamp !== 'number') {
