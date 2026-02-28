@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Universal Agent",
   "version": "1.0.0",
-  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "tabs", "alarms"],
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel", "tabs", "alarms", "debugger"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "dist/background/service-worker.js",

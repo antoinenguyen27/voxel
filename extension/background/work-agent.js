@@ -27,6 +27,12 @@ Rules:
 - If low confidence, ask one concise clarifying question instead of executing.
 - If medium confidence, run inspect_page_map zoom and/or get_action_context first, then execute.
 - If execute_actions returns selector/timeouts, inspect again and retry with improved selectors once.
+- Treat execute_actions as successful only when output.allVerified === true (or every result item has verified=true).
+- Never claim completion if any action is unverified; instead report failure concisely.
+- Never execute actions against a selector that has not been verified to exist (via get_action_context found=true or waitForElement).
+- For Google Sheets cell targets (e.g., C14), prefer selectors like div[aria-label="C14"] and validate them before click/type.
+- Avoid speculative selectors like "Cell C14" or aria row/column index selectors unless they were verified in current context.
+- Never provide frame IDs in tool calls; frame routing is handled by the runtime.
 - Do not claim CSP or permission issues unless the tool error code explicitly indicates that category.
 - Keep your final response to 1-2 sentences — it will be read aloud to the user.`;
 
@@ -136,19 +142,18 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
   });
 
   const inspectPageMapTool = tool(
-    async ({ mode, targetSelector, depth, maxNodes, frameId }) => {
+    async ({ mode, targetSelector, depth, maxNodes }) => {
       const toolName = 'inspect_page_map';
       await reportToolEvent?.({
         phase: 'start',
         tool: toolName,
-        input: { mode, targetSelector, depth, maxNodes, frameId }
+        input: { mode, targetSelector, depth, maxNodes }
       });
       try {
         const result = await executeExecutorCommand({
           tabId,
           command: 'INSPECT_PAGE_MAP',
-          args: { mode, targetSelector, depth, maxNodes },
-          frameId
+          args: { mode, targetSelector, depth, maxNodes }
         });
         if (!result || !result.success) {
           const errorMessage = formatCommandError(result, 'inspection failed');
@@ -190,26 +195,24 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
         mode: z.enum(['summary', 'zoom']).describe('summary for global map, zoom for target region'),
         targetSelector: z.string().max(500).optional().describe('Required for zoom mode; selector of region/element to inspect'),
         depth: z.number().int().min(1).max(7).optional().describe('Traversal depth cap'),
-        maxNodes: z.number().int().min(20).max(500).optional().describe('Node count cap'),
-        frameId: z.number().int().min(0).optional().describe('Optional frame id for same-origin frame targeting')
+        maxNodes: z.number().int().min(20).max(500).optional().describe('Node count cap')
       })
     }
   );
 
   const getActionContextTool = tool(
-    async ({ selector, radius, maxSiblings, maxChildren, frameId }) => {
+    async ({ selector, radius, maxSiblings, maxChildren }) => {
       const toolName = 'get_action_context';
       await reportToolEvent?.({
         phase: 'start',
         tool: toolName,
-        input: { selector, radius, maxSiblings, maxChildren, frameId }
+        input: { selector, radius, maxSiblings, maxChildren }
       });
       try {
         const result = await executeExecutorCommand({
           tabId,
           command: 'GET_ACTION_CONTEXT',
-          args: { selector, radius, maxSiblings, maxChildren },
-          frameId
+          args: { selector, radius, maxSiblings, maxChildren }
         });
         if (!result || !result.success) {
           const errorMessage = formatCommandError(result, 'action context inspection failed');
@@ -251,26 +254,24 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
         selector: z.string().min(1).max(500).describe('Stable selector for the candidate target element'),
         radius: z.number().int().min(1).max(6).optional().describe('How many ancestor levels to include'),
         maxSiblings: z.number().int().min(2).max(20).optional().describe('Max sibling nodes to include'),
-        maxChildren: z.number().int().min(4).max(40).optional().describe('Max descendant nodes to include'),
-        frameId: z.number().int().min(0).optional().describe('Optional frame id for same-origin frame targeting')
+        maxChildren: z.number().int().min(4).max(40).optional().describe('Max descendant nodes to include')
       })
     }
   );
 
   const executeActionsTool = tool(
-    async ({ summary, actions, frameId }) => {
+    async ({ summary, actions }) => {
       const toolName = 'execute_actions';
       await reportToolEvent?.({
         phase: 'start',
         tool: toolName,
-        input: { summary, actionsCount: Array.isArray(actions) ? actions.length : 0, frameId, actions }
+        input: { summary, actionsCount: Array.isArray(actions) ? actions.length : 0, actions }
       });
       try {
         const result = await executeExecutorCommand({
           tabId,
           command: 'RUN_ACTIONS',
-          args: { actions, summary },
-          frameId
+          args: { actions, summary }
         });
         if (!result || !result.success) {
           const errorMessage = formatCommandError(result, 'action execution failed');
@@ -310,8 +311,7 @@ export async function buildWorkAgent({ tabId, executeExecutorCommand, loadAllSki
         'Execute deterministic browser actions. Use a short summary and a typed action list; never send raw JavaScript.',
       schema: z.object({
         summary: z.string().max(300).describe('Short purpose of this action batch'),
-        actions: z.array(ActionSchema).min(1).max(25).describe('Typed actions to execute in order'),
-        frameId: z.number().int().min(0).optional().describe('Optional frame id for same-origin frame targeting')
+        actions: z.array(ActionSchema).min(1).max(25).describe('Typed actions to execute in order')
       })
     }
   );

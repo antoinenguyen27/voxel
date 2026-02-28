@@ -840,7 +840,7 @@
         type: 'WORK_INSTRUCTION',
         transcript: transcript,
         tabId: state.activeTabId
-      });
+      }, 90000);
 
       if (!result.ok) {
         throw new Error(result.error || 'Agent execution failed.');

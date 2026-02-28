@@ -1,20 +1,19 @@
 import { writeSkillFromSegment, loadAllSkills, deleteSkill } from './skill-writer.js';
 import { buildWorkAgent } from './work-agent.js';
+import { createCdpRuntime } from './cdp-runtime.js';
 
 const MODE_IDLE = 'idle';
 const MODE_DEMO = 'demo';
 const MODE_WORK = 'work';
-const FRAME_SWEEP_DELAYS_MS = [1200, 3500, 8000];
 
 const appState = {
   mode: MODE_IDLE,
   activeTabId: null,
-  workPreferredFrameId: null,
   sessionMemory: [],
-  pendingBatch: [],
   demoStartedAt: 0,
   demoSegments: [],
   demoPageScaffold: null,
+  demoActions: [],
   captureDiagnostics: {
     batchesReceived: 0,
     actionsReceived: 0,
@@ -24,7 +23,15 @@ const appState = {
   }
 };
 
-const pendingExecutions = new Map();
+const cdpRuntime = createCdpRuntime({
+  logger(level, message) {
+    safeSendRuntimeMessage({
+      type: 'STATUS_UPDATE',
+      level: level === 'error' ? 'error' : 'info',
+      message
+    }).catch(() => {});
+  }
+});
 
 function resetCaptureDiagnostics() {
   appState.captureDiagnostics = {
@@ -73,121 +80,39 @@ function previewMultiline(text, maxLines = 14, maxChars = 1800) {
   return preview;
 }
 
-function normalizeUrl(value) {
-  try {
-    return new URL(String(value || '')).toString();
-  } catch (_err) {
-    return String(value || '');
-  }
+function withTimeout(promise, timeoutMs, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    })
+  ]);
 }
 
-function scoreFrameCandidate(candidate, transcript) {
-  const href = String(candidate?.url || '').toLowerCase();
-  const title = String(candidate?.title || '').toLowerCase();
-  const transcriptText = String(transcript || '').toLowerCase();
-  let score = 0;
-
-  if (candidate?.frameId === 0) {
-    score += 2;
-  }
-  if (href.startsWith('https://')) {
-    score += 1;
-  }
-  if (title) {
-    score += 1;
-  }
-
-  // Strong negatives for non-target identity providers seen in failing traces.
-  if (href.includes('accounts.google.com/rotatecookiespage')) {
-    score -= 15;
-  }
-  if (href.includes('accounts.google.com')) {
-    score -= 10;
-  }
-
-  if (href.includes('docs.google.com/spreadsheets/')) {
-    score += 14;
-  } else if (href.includes('docs.google.com')) {
-    score += 6;
-  }
-  if (title.includes('google sheets')) {
-    score += 6;
-  }
-  if (transcriptText.includes('google sheets') && href.includes('docs.google.com')) {
-    score += 3;
-  }
-
-  return score;
-}
-
-async function discoverFrameCandidates(tabId) {
+async function enableActionClickToOpenSidePanel() {
   try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: 'MAIN',
-      func: () => {
-        return {
-          url: window.location.href || '',
-          title: document.title || ''
-        };
-      }
-    });
-
-    return (Array.isArray(results) ? results : [])
-      .filter((entry) => typeof entry?.frameId === 'number')
-      .map((entry) => ({
-        frameId: entry.frameId,
-        url: normalizeUrl(entry?.result?.url || ''),
-        title: String(entry?.result?.title || '')
-      }));
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   } catch (err) {
-    console.error('[sw] discoverFrameCandidates failed', { tabId, err });
-    return [];
+    console.error('[sw] setPanelBehavior failed', err);
   }
 }
 
-async function resolvePreferredWorkFrame(tabId, transcript, forceRefresh = false) {
-  if (!forceRefresh && typeof appState.workPreferredFrameId === 'number') {
-    return appState.workPreferredFrameId;
+async function safeSendRuntimeMessage(message) {
+  try {
+    await chrome.runtime.sendMessage(message);
+  } catch (err) {
+    console.error('[sw] safeSendRuntimeMessage failed', err);
   }
+}
 
-  const candidates = await discoverFrameCandidates(tabId);
-  if (!candidates.length) {
-    appState.workPreferredFrameId = 0;
-    return 0;
+async function getInjectableTab(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+    throw new Error('Cannot use this tab for automation');
   }
-
-  const scored = candidates
-    .map((candidate) => ({
-      ...candidate,
-      score: scoreFrameCandidate(candidate, transcript)
-    }))
-    .sort((a, b) => b.score - a.score);
-
-  const chosen = scored[0];
-  appState.workPreferredFrameId = typeof chosen?.frameId === 'number' ? chosen.frameId : 0;
-
-  await safeSendRuntimeMessage({
-    type: 'STATUS_UPDATE',
-    level: 'info',
-    message:
-      `[work-frame] selected frameId=${appState.workPreferredFrameId} score=${chosen?.score ?? 'n/a'} ` +
-      `url=${truncateForLog(chosen?.url || '', 200)}`
-  });
-
-  const alternatives = scored
-    .slice(0, 3)
-    .map((item) => `#${item.frameId}:${item.score}:${truncateForLog(item.url || '', 120)}`)
-    .join(' | ');
-  if (alternatives) {
-    await safeSendRuntimeMessage({
-      type: 'STATUS_UPDATE',
-      level: 'info',
-      message: `[work-frame] candidates ${alternatives}`
-    });
-  }
-
-  return appState.workPreferredFrameId;
+  return tab;
 }
 
 async function captureDemoPageContext(tabId) {
@@ -195,24 +120,18 @@ async function captureDemoPageContext(tabId) {
     return null;
   }
 
-  try {
-    const summaryResult = await executeExecutorCommandInTab({
-      tabId,
-      command: 'INSPECT_PAGE_MAP',
-      args: { mode: 'summary', depth: 4, maxNodes: 220 }
-    });
-    if (!summaryResult?.success) {
-      return null;
-    }
-
-    return {
-      summary: summaryResult.output || null,
-      zooms: []
-    };
-  } catch (err) {
-    console.warn('[sw] captureDemoPageContext failed', err);
+  const result = await cdpRuntime.runCommand(tabId, 'INSPECT_PAGE_MAP', {
+    mode: 'summary',
+    depth: 4,
+    maxNodes: 220
+  });
+  if (!result?.success) {
     return null;
   }
+  return {
+    summary: result.output || null,
+    zooms: []
+  };
 }
 
 async function sendCaptureDiagStatus(message, level = 'info') {
@@ -221,24 +140,6 @@ async function sendCaptureDiagStatus(message, level = 'info') {
     level,
     message: `[capture-diag] ${message}`
   });
-}
-
-function formatActionDetail(actionRecord) {
-  const action = actionRecord?.action || 'unknown';
-  switch (action) {
-    case 'click':
-      return `click selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" tag="${truncateForLog(actionRecord?.tag || '', 40)}" label="${truncateForLog(actionRecord?.ariaLabel || '', 80)}" text="${truncateForLog(actionRecord?.innerText || '', 80)}"`;
-    case 'fill':
-      return `fill selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" label="${truncateForLog(actionRecord?.ariaLabel || '', 80)}" value="${truncateForLog(actionRecord?.value || '', 120)}"`;
-    case 'selectOptions':
-      return `selectOptions selector="${truncateForLog(actionRecord?.selector || 'null', 120)}" value="${truncateForLog(actionRecord?.value || '', 100)}"`;
-    case 'keyboard':
-      return `keyboard type="${truncateForLog(actionRecord?.eventType || 'keydown', 40)}" key="${truncateForLog(actionRecord?.key || '', 40)}" code="${truncateForLog(actionRecord?.code || '', 40)}" ctrl=${!!actionRecord?.ctrlKey} meta=${!!actionRecord?.metaKey} alt=${!!actionRecord?.altKey} shift=${!!actionRecord?.shiftKey} selector="${truncateForLog(actionRecord?.selector || 'null', 120)}"`;
-    case 'network':
-      return `network method="${truncateForLog(actionRecord?.method || '', 10)}" url="${truncateForLog(actionRecord?.url || '', 160)}" status="${truncateForLog(actionRecord?.status || '', 10)}"`;
-    default:
-      return `unknown payload="${truncateForLog(JSON.stringify(actionRecord), 180)}"`;
-  }
 }
 
 function maybeSendCaptureDiagStatus(message, level = 'info', force = false) {
@@ -251,170 +152,25 @@ function maybeSendCaptureDiagStatus(message, level = 'info', force = false) {
   sendCaptureDiagStatus(message, level).catch(() => {});
 }
 
-async function injectAllFramesSweep(tabId, reason) {
-  try {
-    await getInjectableTab(tabId);
-    const prefix = getScriptPrefix();
-    const files = [`${prefix}lib/selector.js`, `${prefix}content/capture.js`, `${prefix}content/executor.js`];
-
-    for (const file of files) {
-      await withTimeout(
-        chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          files: [file],
-          world: 'MAIN'
-        }),
-        3500,
-        `${reason} ${file} allFrames sweep`
-      );
-    }
-    maybeSendCaptureDiagStatus(`frame sweep success (${reason}) on tab=${tabId}`, 'info');
-  } catch (err) {
-    maybeSendCaptureDiagStatus(
-      `frame sweep partial/failed (${reason}) on tab=${tabId}: ${err && err.message ? err.message : String(err)}`,
-      'info'
-    );
-  }
-}
-
-function scheduleFrameCoverageSweeps(tabId, mode) {
-  for (let i = 0; i < FRAME_SWEEP_DELAYS_MS.length; i += 1) {
-    const delayMs = FRAME_SWEEP_DELAYS_MS[i];
-    setTimeout(() => {
-      if (appState.mode !== mode) {
-        return;
-      }
-      if (appState.activeTabId !== tabId) {
-        return;
-      }
-      injectAllFramesSweep(tabId, `${mode}#${i + 1}`).catch(() => {});
-    }, delayMs);
-  }
-}
-
-function withTimeout(promise, timeoutMs, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    })
-  ]);
-}
-
-async function executeScriptBestEffort(tabId, file, world) {
-  const allFramesLabel = `${file} allFrames injection`;
-  const topFrameLabel = `${file} topFrame injection`;
-
-  try {
-    await withTimeout(
-      chrome.scripting.executeScript({
-        target: { tabId, allFrames: true },
-        files: [file],
-        world
-      }),
-      3500,
-      allFramesLabel
-    );
-    return { scope: 'allFrames' };
-  } catch (allFramesErr) {
-    console.warn('[sw] allFrames injection failed, falling back to top frame', {
-      tabId,
-      file,
-      error: allFramesErr?.message || String(allFramesErr)
-    });
-  }
-
-  await withTimeout(
-    chrome.scripting.executeScript({
-      target: { tabId },
-      files: [file],
-      world
-    }),
-    3500,
-    topFrameLabel
-  );
-  return { scope: 'topFrame' };
-}
-
-async function enableActionClickToOpenSidePanel() {
-  try {
-    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-  } catch (err) {
-    console.error('[sw] setPanelBehavior failed', err);
-  }
-}
-
-function getScriptPrefix() {
-  try {
-    const swPath = chrome.runtime.getManifest()?.background?.service_worker || '';
-    return swPath.startsWith('dist/') ? 'dist/' : '';
-  } catch (_err) {
-    return '';
-  }
-}
-
-async function safeSendRuntimeMessage(message) {
-  try {
-    await chrome.runtime.sendMessage(message);
-  } catch (err) {
-    console.error('[sw] safeSendRuntimeMessage failed', err);
-  }
-}
-
-async function safeSendTabMessage(tabId, message) {
-  try {
-    if (typeof tabId !== 'number') {
-      return;
-    }
-    await chrome.tabs.sendMessage(tabId, message);
-  } catch (err) {
-    console.error('[sw] safeSendTabMessage failed', { tabId, messageType: message?.type, err });
-  }
-}
-
-async function getInjectableTab(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
-    throw new Error('Cannot inject into this tab');
-  }
-  return tab;
-}
-
-export async function injectMainWorldScripts(tabId) {
-  try {
-    await getInjectableTab(tabId);
-    const prefix = getScriptPrefix();
-    const files = [`${prefix}lib/selector.js`, `${prefix}content/capture.js`, `${prefix}content/executor.js`];
-
-    for (const file of files) {
-      const result = await executeScriptBestEffort(tabId, file, 'MAIN');
-      console.log('[sw] injected main-world script', { tabId, file, scope: result.scope });
-    }
-  } catch (err) {
-    console.error('[sw] injectMainWorldScripts failed', { tabId, err });
-    throw err;
-  }
-}
-
 async function startDemoMode(tabId) {
   try {
+    await getInjectableTab(tabId);
     resetCaptureDiagnostics();
     appState.mode = MODE_DEMO;
     appState.activeTabId = tabId;
-    appState.pendingBatch = [];
     appState.demoStartedAt = Date.now();
     appState.demoSegments = [];
+    appState.demoActions = [];
     appState.demoPageScaffold = null;
-    await withTimeout(injectMainWorldScripts(tabId), 25000, 'Demo injection');
+
+    await withTimeout(cdpRuntime.startDemoCapture(tabId), 15000, 'CDP demo capture start');
     appState.demoPageScaffold = await captureDemoPageContext(tabId);
-    scheduleFrameCoverageSweeps(tabId, MODE_DEMO);
+
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Demo mode started.' });
-    maybeSendCaptureDiagStatus(`capture pipeline armed for tab=${tabId}; waiting for ACTION_BATCH...`, 'info', true);
+    maybeSendCaptureDiagStatus(`capture pipeline armed for tab=${tabId}; waiting for VOICE_SEGMENT...`, 'info', true);
     if (appState.demoPageScaffold?.summary) {
       maybeSendCaptureDiagStatus(
-        `captured demo scaffold title="${truncateForLog(appState.demoPageScaffold.summary.title || '', 80)}" nodes=${appState.demoPageScaffold.summary.totalNodes || 0}`,
+        `captured demo scaffold title="${truncateForLog(appState.demoPageScaffold.summary.title || '', 80)}"`,
         'info',
         true
       );
@@ -427,99 +183,141 @@ async function startDemoMode(tabId) {
   }
 }
 
+function normalizeRecordedActions(actions, demoStartedAt) {
+  const normalized = [];
+  const breakdown = {};
+  for (const action of Array.isArray(actions) ? actions : []) {
+    const actionType = action?.action || 'unknown';
+    breakdown[actionType] = (breakdown[actionType] || 0) + 1;
+    const absoluteTs = typeof action?.timestamp === 'number' ? action.timestamp : Date.now();
+    const relativeTimestamp = Math.max(0, absoluteTs - demoStartedAt);
+    normalized.push({
+      ...action,
+      timestamp: relativeTimestamp
+    });
+  }
+  return { normalized, breakdown };
+}
+
+function assignEventsToSegments(segments, events) {
+  const sortedSegments = segments.map((s, idx) => ({ ...s, __index: idx, events: [] }));
+  const sortedEvents = events.slice().sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+  for (const event of sortedEvents) {
+    const ts = typeof event?.timestamp === 'number' ? event.timestamp : 0;
+    let assigned = false;
+    for (let i = 0; i < sortedSegments.length; i += 1) {
+      const segment = sortedSegments[i];
+      const end = Number.isFinite(segment.segmentEnd) ? segment.segmentEnd : null;
+      if (end !== null && ts <= end) {
+        segment.events.push(event);
+        assigned = true;
+        break;
+      }
+    }
+    if (!assigned) {
+      if (sortedSegments.length) {
+        sortedSegments[sortedSegments.length - 1].events.push(event);
+      } else {
+        sortedSegments.push({
+          transcript: '[No transcript captured]',
+          segmentStart: 0,
+          segmentEnd: ts,
+          events: [event],
+          __index: 0
+        });
+      }
+    }
+  }
+
+  return sortedSegments.sort((a, b) => a.__index - b.__index);
+}
+
 async function stopDemoMode() {
   try {
     const tabId = appState.activeTabId;
-    await safeSendTabMessage(tabId, { type: 'STOP_CAPTURE' });
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const demoStartedAt = appState.demoStartedAt || Date.now();
 
-    const demoSegments = appState.demoSegments.slice();
-    const trailingEvents = appState.pendingBatch.slice();
+    const recorded = await withTimeout(cdpRuntime.stopDemoCapture(tabId), 15000, 'CDP demo capture stop');
+    const { normalized: normalizedEvents, breakdown } = normalizeRecordedActions(recorded, demoStartedAt);
 
-    if (demoSegments.length || trailingEvents.length) {
-      if (trailingEvents.length) {
-        if (demoSegments.length) {
-          const last = demoSegments[demoSegments.length - 1];
-          last.events = (last.events || []).concat(trailingEvents);
-        } else {
-          demoSegments.push({
-            transcript: '[No transcript captured]',
-            segmentStart: 0,
-            segmentEnd: trailingEvents[trailingEvents.length - 1]?.timestamp || 0,
-            events: trailingEvents
-          });
+    appState.demoActions = normalizedEvents;
+    appState.captureDiagnostics.actionsReceived = normalizedEvents.length;
+    appState.captureDiagnostics.byAction = breakdown;
+
+    let demoSegments = assignEventsToSegments(appState.demoSegments, normalizedEvents);
+
+    const finalTranscript = demoSegments
+      .map((segment) => String(segment.transcript || '').trim())
+      .filter(Boolean)
+      .join('\n');
+
+    const transcriptTimeline = demoSegments
+      .map((segment) => {
+        const text = String(segment.transcript || '').trim();
+        if (!text) {
+          return null;
         }
-      }
+        const ts =
+          typeof segment.segmentEnd === 'number' && Number.isFinite(segment.segmentEnd)
+            ? segment.segmentEnd
+            : typeof segment.segmentStart === 'number' && Number.isFinite(segment.segmentStart)
+              ? segment.segmentStart
+              : 0;
+        return `[${formatRelativeTime(ts)}] ${text}`;
+      })
+      .filter(Boolean)
+      .join('\n');
 
-      const finalTranscript = demoSegments
-        .map((segment) => String(segment.transcript || '').trim())
-        .filter(Boolean)
-        .join('\n');
-      const transcriptTimeline = demoSegments
-        .map((segment) => {
-          const text = String(segment.transcript || '').trim();
-          if (!text) {
-            return null;
-          }
-          const ts =
-            typeof segment.segmentEnd === 'number' && Number.isFinite(segment.segmentEnd)
-              ? segment.segmentEnd
-              : typeof segment.segmentStart === 'number' && Number.isFinite(segment.segmentStart)
-                ? segment.segmentStart
-                : 0;
-          return `[${formatRelativeTime(ts)}] ${text}`;
-        })
-        .filter(Boolean)
-        .join('\n');
-      const finalEvents = demoSegments.flatMap((segment) => (Array.isArray(segment.events) ? segment.events : []));
-      const pageContext = appState.demoPageScaffold || null;
+    const finalEvents = demoSegments.flatMap((segment) => (Array.isArray(segment.events) ? segment.events : []));
+    const pageContext = appState.demoPageScaffold || null;
 
-      if (finalTranscript && finalEvents.length) {
-        await safeSendRuntimeMessage({
-          type: 'STATUS_UPDATE',
-          level: 'info',
-          message: 'Generating skill from recorded demo...'
-        });
-        const skillResult = await writeSkillFromSegment(finalTranscript, finalEvents, {
-          transcriptTimeline,
-          pageContext
-        });
-        const skillName = typeof skillResult === 'string' ? skillResult : skillResult?.skillName || `skill-${Date.now()}`;
-        const skillContent = typeof skillResult === 'string' ? '' : skillResult?.skillText || '';
-        const promptInput = typeof skillResult === 'string' ? null : skillResult?.promptInput || null;
-        await safeSendRuntimeMessage({
-          type: 'STATUS_UPDATE',
-          level: 'success',
-          message: `Saved skill: ${skillName}`
-        });
-        await safeSendRuntimeMessage({
-          type: 'DEMO_SKILL_RESULT',
-          skillName,
-          skillContent,
-          debug: {
-            transcriptTimelinePreview: previewMultiline(transcriptTimeline, 14, 1800),
-            actionsPreview: previewMultiline(promptInput?.observedActions || '', 18, 2600),
-            pageContextPreview: previewMultiline(promptInput?.pageContext || '', 18, 2600),
-            transcriptPreview: previewMultiline(finalTranscript, 8, 1000),
-            actionCount: finalEvents.length,
-            segmentCount: demoSegments.length
-          }
-        });
-      } else {
-        await safeSendRuntimeMessage({
-          type: 'STATUS_UPDATE',
-          level: 'info',
-          message: 'Demo stopped with no complete transcript+event payload to process.'
-        });
-      }
+    if (finalTranscript && finalEvents.length) {
+      await safeSendRuntimeMessage({
+        type: 'STATUS_UPDATE',
+        level: 'info',
+        message: 'Generating skill from recorded demo...'
+      });
+      const skillResult = await writeSkillFromSegment(finalTranscript, finalEvents, {
+        transcriptTimeline,
+        pageContext
+      });
+      const skillName = typeof skillResult === 'string' ? skillResult : skillResult?.skillName || `skill-${Date.now()}`;
+      const skillContent = typeof skillResult === 'string' ? '' : skillResult?.skillText || '';
+      const promptInput = typeof skillResult === 'string' ? null : skillResult?.promptInput || null;
+      await safeSendRuntimeMessage({
+        type: 'STATUS_UPDATE',
+        level: 'success',
+        message: `Saved skill: ${skillName}`
+      });
+      await safeSendRuntimeMessage({
+        type: 'DEMO_SKILL_RESULT',
+        skillName,
+        skillContent,
+        debug: {
+          transcriptTimelinePreview: previewMultiline(transcriptTimeline, 14, 1800),
+          actionsPreview: previewMultiline(promptInput?.observedActions || '', 18, 2600),
+          pageContextPreview: previewMultiline(promptInput?.pageContext || '', 18, 2600),
+          transcriptPreview: previewMultiline(finalTranscript, 8, 1000),
+          actionCount: finalEvents.length,
+          segmentCount: demoSegments.length
+        }
+      });
+    } else {
+      await safeSendRuntimeMessage({
+        type: 'STATUS_UPDATE',
+        level: 'info',
+        message: 'Demo stopped with no complete transcript+event payload to process.'
+      });
     }
 
     appState.mode = MODE_IDLE;
     appState.activeTabId = null;
-    appState.pendingBatch = [];
     appState.demoStartedAt = 0;
     appState.demoSegments = [];
     appState.demoPageScaffold = null;
+    appState.demoActions = [];
+
     maybeSendCaptureDiagStatus(
       `summary batches=${appState.captureDiagnostics.batchesReceived} actions=${appState.captureDiagnostics.actionsReceived} ignored=${appState.captureDiagnostics.ignoredBatches} byAction=${formatActionBreakdown(appState.captureDiagnostics.byAction)}`,
       'info',
@@ -529,81 +327,6 @@ async function stopDemoMode() {
   } catch (err) {
     console.error('[sw] stopDemoMode failed', err);
     throw err;
-  }
-}
-
-function handleActionBatch(message, sender) {
-  try {
-    if (appState.mode !== MODE_DEMO) {
-      appState.captureDiagnostics.ignoredBatches += 1;
-      if (appState.captureDiagnostics.ignoredBatches <= 3 || appState.captureDiagnostics.ignoredBatches % 10 === 0) {
-        maybeSendCaptureDiagStatus(
-          `ignored ACTION_BATCH while mode=${appState.mode}; tab=${sender?.tab?.id ?? 'n/a'} frame=${sender?.frameId ?? 'n/a'}`,
-          'info',
-          true
-        );
-      }
-      return;
-    }
-    if (!Array.isArray(message.actions)) {
-      appState.captureDiagnostics.ignoredBatches += 1;
-      maybeSendCaptureDiagStatus(
-        `received ACTION_BATCH without actions[] payload; keys=${Object.keys(message || {}).join(', ') || 'none'}`,
-        'error',
-        true
-      );
-      return;
-    }
-    const demoStartedAt = appState.demoStartedAt || Date.now();
-    const fallbackTimestamp = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
-    const normalizedEvents = message.actions.map((event) => {
-      const sourceTimestamp = typeof event?.timestamp === 'number' ? event.timestamp : fallbackTimestamp;
-      const relativeTimestamp = Math.max(0, sourceTimestamp - demoStartedAt);
-      if (event && typeof event === 'object' && typeof event.timestamp !== 'number') {
-        return {
-          ...event,
-          timestamp: relativeTimestamp
-        };
-      }
-      if (event && typeof event === 'object') {
-        return {
-          ...event,
-          timestamp: relativeTimestamp
-        };
-      }
-      return event;
-    });
-    appState.pendingBatch.push(...normalizedEvents);
-
-    const byActionInBatch = {};
-    for (const actionRecord of normalizedEvents) {
-      const actionType = actionRecord?.action || 'unknown';
-      byActionInBatch[actionType] = (byActionInBatch[actionType] || 0) + 1;
-      appState.captureDiagnostics.byAction[actionType] = (appState.captureDiagnostics.byAction[actionType] || 0) + 1;
-    }
-
-    appState.captureDiagnostics.batchesReceived += 1;
-    appState.captureDiagnostics.actionsReceived += normalizedEvents.length;
-
-    const shouldReport =
-      appState.captureDiagnostics.batchesReceived <= 3 || appState.captureDiagnostics.batchesReceived % 5 === 0;
-    if (shouldReport) {
-      maybeSendCaptureDiagStatus(
-        `batch#${appState.captureDiagnostics.batchesReceived} actions=${normalizedEvents.length} totalActions=${appState.captureDiagnostics.actionsReceived} inBatch=${formatActionBreakdown(byActionInBatch)} totalByAction=${formatActionBreakdown(appState.captureDiagnostics.byAction)} tab=${sender?.tab?.id ?? 'n/a'} frame=${sender?.frameId ?? 'n/a'} pending=${appState.pendingBatch.length}`,
-        'info'
-      );
-    }
-
-    const senderTab = sender?.tab?.id ?? 'n/a';
-    const senderFrame = sender?.frameId ?? 'n/a';
-    for (const actionRecord of normalizedEvents) {
-      const at = formatRelativeTime(actionRecord?.timestamp);
-      const detail = formatActionDetail(actionRecord);
-      sendCaptureDiagStatus(`action@${at} ${detail} tab=${senderTab} frame=${senderFrame}`).catch(() => {});
-    }
-  } catch (err) {
-    console.error('[sw] handleActionBatch failed', err);
-    maybeSendCaptureDiagStatus(`handleActionBatch error: ${err && err.message ? err.message : String(err)}`, 'error', true);
   }
 }
 
@@ -618,48 +341,30 @@ async function handleVoiceSegment(message) {
       return { ok: false, skipped: true, reason: 'Empty transcript.' };
     }
 
+    const segmentStartAbsolute =
+      typeof message.segmentStart === 'number' && Number.isFinite(message.segmentStart) ? message.segmentStart : null;
     const segmentEndAbsolute =
       typeof message.segmentEnd === 'number' && Number.isFinite(message.segmentEnd) ? message.segmentEnd : null;
-    const segmentEnd =
-      segmentEndAbsolute === null
-        ? null
-        : Math.max(0, segmentEndAbsolute - (appState.demoStartedAt || segmentEndAbsolute));
 
-    let events = [];
-    if (segmentEnd === null) {
-      events = appState.pendingBatch.splice(0, appState.pendingBatch.length);
-    } else {
-      const toProcess = [];
-      const keepForNextSegment = [];
-      for (const event of appState.pendingBatch) {
-        const ts = typeof event?.timestamp === 'number' ? event.timestamp : 0;
-        if (ts > 0 && ts <= segmentEnd) {
-          toProcess.push(event);
-        } else if (ts === 0) {
-          toProcess.push({
-            ...event,
-            timestamp: segmentEnd
-          });
-        } else {
-          keepForNextSegment.push(event);
-        }
-      }
-      appState.pendingBatch = keepForNextSegment;
-      events = toProcess;
-    }
+    const segmentStart =
+      segmentStartAbsolute === null
+        ? null
+        : Math.max(0, segmentStartAbsolute - (appState.demoStartedAt || segmentStartAbsolute));
+    const segmentEnd =
+      segmentEndAbsolute === null ? null : Math.max(0, segmentEndAbsolute - (appState.demoStartedAt || segmentEndAbsolute));
 
     appState.demoSegments.push({
       transcript,
-      segmentStart: typeof message.segmentStart === 'number' ? message.segmentStart : null,
-      segmentEnd: segmentEnd,
-      events
+      segmentStart,
+      segmentEnd,
+      events: []
     });
 
     return {
       ok: true,
       buffered: true,
       segmentCount: appState.demoSegments.length,
-      eventCount: events.length
+      eventCount: 0
     };
   } catch (err) {
     console.error('[sw] handleVoiceSegment failed', err);
@@ -674,97 +379,32 @@ async function handleVoiceSegment(message) {
 
 async function startWorkMode(tabId) {
   try {
+    await getInjectableTab(tabId);
     appState.mode = MODE_WORK;
     appState.activeTabId = tabId;
-    appState.workPreferredFrameId = null;
     appState.sessionMemory = [];
-    await withTimeout(injectMainWorldScripts(tabId), 25000, 'Work injection');
-    scheduleFrameCoverageSweeps(tabId, MODE_WORK);
-    await resolvePreferredWorkFrame(tabId, '', true);
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Work mode started.' });
   } catch (err) {
     console.error('[sw] startWorkMode failed', err);
     appState.mode = MODE_IDLE;
     appState.activeTabId = null;
-    appState.workPreferredFrameId = null;
     throw err;
   }
 }
 
 async function stopWorkMode() {
   try {
+    const tabId = appState.activeTabId;
     appState.mode = MODE_IDLE;
     appState.sessionMemory = [];
     appState.activeTabId = null;
-    appState.workPreferredFrameId = null;
+    if (typeof tabId === 'number') {
+      await cdpRuntime.cleanupTab(tabId);
+    }
     await safeSendRuntimeMessage({ type: 'STATUS_UPDATE', level: 'info', message: 'Work mode stopped.' });
   } catch (err) {
     console.error('[sw] stopWorkMode failed', err);
     throw err;
-  }
-}
-
-async function executeExecutorCommandInTab({ tabId, command, args, frameId, timeoutMs }) {
-  const executionId = crypto.randomUUID();
-  const timeoutValue = Number.isFinite(timeoutMs) ? Math.max(3000, Math.min(25000, timeoutMs)) : 12000;
-
-  return new Promise(async (resolve) => {
-    const timeout = setTimeout(() => {
-      pendingExecutions.delete(executionId);
-      resolve({
-        success: false,
-        errorCode: 'TIMEOUT',
-        error: `Timeout: ${String(command || 'command')} did not complete in ${Math.round(timeoutValue / 1000)}s`,
-        output: null
-      });
-    }, timeoutValue);
-
-    pendingExecutions.set(executionId, { resolve, timeout });
-
-    try {
-      const options = typeof frameId === 'number' ? { frameId } : undefined;
-      await chrome.tabs.sendMessage(
-        tabId,
-        {
-          type: 'EXECUTOR_COMMAND',
-          command,
-          args: args || {},
-          executionId
-        },
-        options
-      );
-    } catch (err) {
-      clearTimeout(timeout);
-      pendingExecutions.delete(executionId);
-      resolve({
-        success: false,
-        errorCode: 'MESSAGE_DISPATCH_FAILED',
-        error: err && err.message ? err.message : String(err),
-        output: null
-      });
-    }
-  });
-}
-
-function handleExecutionResult(message) {
-  try {
-    const executionId = message.executionId;
-    if (!executionId || !pendingExecutions.has(executionId)) {
-      return;
-    }
-
-    const pending = pendingExecutions.get(executionId);
-    clearTimeout(pending.timeout);
-    pendingExecutions.delete(executionId);
-
-    pending.resolve({
-      success: !!message.success,
-      errorCode: message.errorCode || null,
-      error: message.error || null,
-      output: message.output ?? null
-    });
-  } catch (err) {
-    console.error('[sw] handleExecutionResult failed', err);
   }
 }
 
@@ -777,7 +417,8 @@ async function handleWorkInstruction(transcript, tabId) {
     if (typeof targetTabId !== 'number') {
       throw new Error('No active tab for work mode.');
     }
-    await resolvePreferredWorkFrame(targetTabId, transcript, false);
+
+    await cdpRuntime.beginTask(targetTabId, transcript || 'work_instruction');
 
     const emitToolEvent = async (event) => {
       try {
@@ -803,43 +444,15 @@ async function handleWorkInstruction(transcript, tabId) {
       }
     };
 
-    const executeWithPreferredFrame = async ({ tabId, command, args, frameId, timeoutMs }) => {
-      const explicitFrame = typeof frameId === 'number';
-      const selectedFrame = explicitFrame ? frameId : appState.workPreferredFrameId;
-      let result = await executeExecutorCommandInTab({
-        tabId,
-        command,
-        args,
-        frameId: typeof selectedFrame === 'number' ? selectedFrame : undefined,
-        timeoutMs
-      });
-
-      if (!explicitFrame && result?.success === false && result?.errorCode === 'MESSAGE_DISPATCH_FAILED') {
-        const previousFrame = appState.workPreferredFrameId;
-        await resolvePreferredWorkFrame(tabId, transcript, true);
-        if (appState.workPreferredFrameId !== previousFrame) {
-          await safeSendRuntimeMessage({
-            type: 'STATUS_UPDATE',
-            level: 'info',
-            message:
-              `[work-frame] retrying ${command} on new frameId=${appState.workPreferredFrameId} ` +
-              `after dispatch failure on frameId=${previousFrame}`
-          });
-        }
-        result = await executeExecutorCommandInTab({
-          tabId,
-          command,
-          args,
-          frameId: typeof appState.workPreferredFrameId === 'number' ? appState.workPreferredFrameId : undefined,
-          timeoutMs
-        });
-      }
-      return result;
+    const executeExecutorCommand = async ({ tabId: tabIdFromTool, command, args, timeoutMs }) => {
+      const usedTabId = typeof tabIdFromTool === 'number' ? tabIdFromTool : targetTabId;
+      const commandResult = await cdpRuntime.runCommand(usedTabId, command, args || {}, timeoutMs);
+      return commandResult;
     };
 
     const agent = await buildWorkAgent({
       tabId: targetTabId,
-      executeExecutorCommand: executeWithPreferredFrame,
+      executeExecutorCommand,
       loadAllSkills,
       reportToolEvent: emitToolEvent,
       getSessionMemory: function () {
@@ -865,6 +478,11 @@ async function handleWorkInstruction(transcript, tabId) {
   } catch (err) {
     console.error('[sw] handleWorkInstruction failed', err);
     return { ok: false, error: err && err.message ? err.message : String(err), response: '' };
+  } finally {
+    const targetTabId = typeof tabId === 'number' ? tabId : appState.activeTabId;
+    if (typeof targetTabId === 'number') {
+      await cdpRuntime.endTask(targetTabId).catch(() => {});
+    }
   }
 }
 
@@ -893,25 +511,6 @@ chrome.action.onClicked.addListener(async function (tab) {
     }
   } catch (err) {
     console.error('[sw] action click failed to open side panel', err);
-  }
-});
-
-chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
-  if (changeInfo.status !== 'complete') {
-    return;
-  }
-  if ((appState.mode === MODE_DEMO || appState.mode === MODE_WORK) && tabId === appState.activeTabId) {
-    if (appState.mode === MODE_WORK) {
-      appState.workPreferredFrameId = null;
-    }
-    injectMainWorldScripts(tabId).catch(async (err) => {
-      console.error('[sw] reinjection failed', err);
-      await safeSendRuntimeMessage({
-        type: 'STATUS_UPDATE',
-        level: 'error',
-        message: `Re-injection failed: ${err && err.message ? err.message : String(err)}`
-      });
-    });
   }
 });
 
@@ -987,7 +586,11 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           break;
 
         case 'ACTION_BATCH':
-          handleActionBatch(message, sender);
+          appState.captureDiagnostics.ignoredBatches += 1;
+          maybeSendCaptureDiagStatus(
+            `ignored legacy ACTION_BATCH while mode=${appState.mode}; tab=${sender?.tab?.id ?? 'n/a'} frame=${sender?.frameId ?? 'n/a'}`,
+            'info'
+          );
           sendResponse({ ok: true });
           break;
 
@@ -1011,11 +614,6 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           sendResponse(result);
           break;
         }
-
-        case 'EXECUTION_RESULT':
-          handleExecutionResult(message);
-          sendResponse({ ok: true });
-          break;
 
         default:
           sendResponse({ ok: false, error: `Unknown message type: ${message?.type}` });
