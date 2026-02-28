@@ -5,10 +5,12 @@
     demoRecorder: null,
     demoStream: null,
     demoChunks: [],
+    demoTranscript: '',
     isDemoTranscribing: false,
     workRecorder: null,
     workStream: null,
     workChunks: [],
+    workTranscript: '',
     isListening: false,
     heartbeatTimer: null
   };
@@ -191,6 +193,18 @@
     }, 15000);
   }
 
+  function appendTranscript(existing, chunk) {
+    var left = String(existing || '').trim();
+    var right = String(chunk || '').trim();
+    if (!right) {
+      return left;
+    }
+    if (!left) {
+      return right;
+    }
+    return left + '\n' + right;
+  }
+
   function stopHeartbeat() {
     if (state.heartbeatTimer) {
       clearInterval(state.heartbeatTimer);
@@ -258,6 +272,7 @@
       appendLog('Microphone stream acquired.');
 
       state.demoChunks = [];
+      state.demoTranscript = '';
       state.demoRecorder = new MediaRecorder(state.demoStream, { mimeType: 'audio/webm' });
 
       state.demoRecorder.ondataavailable = function (event) {
@@ -287,12 +302,14 @@
           state.isDemoTranscribing = true;
           var transcript = await transcribeWithVoxtral(blob);
           if (transcript) {
-            els.transcriptText.textContent = transcript;
+            state.demoTranscript = appendTranscript(state.demoTranscript, transcript);
+            els.transcriptText.textContent = state.demoTranscript;
             appendLog('Demo transcript: ' + transcript);
             try {
               await sendRuntimeMessage({
                 type: 'VOICE_SEGMENT',
                 transcript: transcript,
+                fullTranscript: state.demoTranscript,
                 segmentEnd: Date.now()
               });
             } catch (err) {
@@ -357,6 +374,7 @@
     state.demoRecorder = null;
     state.demoStream = null;
     state.demoChunks = [];
+    state.demoTranscript = '';
     state.isDemoTranscribing = false;
   }
 
@@ -367,6 +385,7 @@
       setStatus('Listening...', 'busy');
 
       state.workChunks = [];
+      state.workTranscript = '';
       state.workStream = await getUserMediaWithTimeout({ audio: true }, 12000);
       state.workRecorder = new MediaRecorder(state.workStream, { mimeType: 'audio/webm' });
 
@@ -411,7 +430,8 @@
             var blob = new Blob(state.workChunks, { type: 'audio/webm' });
             state.workChunks = [];
             var transcript = await transcribeWithVoxtral(blob);
-            els.transcriptText.textContent = transcript;
+            state.workTranscript = appendTranscript(state.workTranscript, transcript);
+            els.transcriptText.textContent = state.workTranscript;
             resolve(transcript);
           } catch (err) {
             reject(err);
@@ -507,6 +527,8 @@
       runtimeStarted = true;
 
       state.mode = 'demo';
+      state.demoTranscript = '';
+      els.transcriptText.textContent = '';
       updateButtons();
       setStatus('Demo recording...', 'busy');
       startHeartbeat();
@@ -565,6 +587,8 @@
       }
 
       state.mode = 'work';
+      state.workTranscript = '';
+      els.transcriptText.textContent = '';
       updateButtons();
       setStatus('Ready', 'ready');
       startHeartbeat();
@@ -588,6 +612,7 @@
       state.mode = 'idle';
       state.activeTabId = null;
       state.isListening = false;
+      state.workTranscript = '';
       updateButtons();
       setStatus('Idle', 'idle');
       stopHeartbeat();
